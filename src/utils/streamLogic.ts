@@ -4,8 +4,20 @@ export type ParsedTarget =
   | { kind: 'tv'; tmdbId: string; season: number; episode: number }
   | { kind: 'invalid'; reason: string };
 
-export function parseTmdbTarget(rawInput: string): ParsedTarget {
-  const trimmed = rawInput.trim();
+export function parseTmdbTarget(rawInput: unknown): ParsedTarget {
+  if (typeof rawInput === 'object' && rawInput !== null) {
+    const obj = rawInput as Record<string, unknown>;
+    const tmdbId = String(obj.tmdbId || obj.id || '').trim();
+    if (obj.kind === 'tv' || ('season' in obj && 'episode' in obj)) {
+      const season = Math.max(1, Number(obj.season) || 1);
+      const episode = Math.max(1, Number(obj.episode) || 1);
+      if (tmdbId) return { kind: 'tv', tmdbId, season, episode };
+    }
+    if (tmdbId) return { kind: 'movie', tmdbId };
+  }
+
+  const str = typeof rawInput === 'string' ? rawInput : String(rawInput ?? '');
+  const trimmed = str.trim();
   if (!trimmed) {
     return { kind: 'invalid', reason: 'Informe um ID de filme, série (ex: 62650/12/2) ou URL direta.' };
   }

@@ -149,14 +149,9 @@ export const SearchModal: React.FC<SearchModalProps> = ({
                     className="w-12 h-18 object-cover rounded-lg bg-stone-900 shrink-0"
                   />
                   <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold text-white truncate">
-                        {item.title}
-                      </span>
-                      <span className="text-[11px] font-display font-medium tracking-wide text-stone-300 border border-white/15 px-1.5 py-0.5 rounded shrink-0">
-                        {item.qualityBadge}
-                      </span>
-                    </div>
+                    <p className="text-sm font-semibold text-white truncate">
+                      {item.title}
+                    </p>
                     <div className="flex items-center gap-2 text-xs text-stone-400">
                       {item.mediaType === 'movie' ? (
                         <Film className="w-3.5 h-3.5" />

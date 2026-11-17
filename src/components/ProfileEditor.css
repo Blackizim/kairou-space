@@ -1467,3 +1467,8 @@
 @media (max-width: 600px) { .rea-profile .pm__hero { grid-template-columns: 84px 1fr; gap: 14px; padding: 12px; } .rea-profile .pm__preview { width: 84px !important; height: 84px !important; min-width: 84px !important; max-width: 84px !important; min-height: 84px !important; max-height: 84px !important; border-radius: 18px; } }
 
 .rea-profile .rea-vip { font-size:9.5px; padding:2px 7px; background:linear-gradient(135deg,#eab308,#f59e0b); color:#000; font-weight:900; border-radius:5px; }
+
+.rea-profile .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--muted-2); margin-bottom: 8px; }
+.rea-profile .form { display: grid; gap: 14px; margin-top: 20px; }
+.rea-profile .form__error { padding: 10px 12px; border-radius: 10px; background: rgba(255,90,90,.12); border: 1px solid rgba(255,90,90,.3); color: #ffb4ad; font-size: 12.5px; font-weight: 500; }
+.rea-profile .btn--block { width: 100%; justify-content: center; }

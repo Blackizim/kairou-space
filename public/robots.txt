@@ -1,0 +1,47 @@
+# Robots.txt for Kairou Streaming (https://www.kairou.space)
+User-agent: *
+Allow: /
+Allow: /filme/
+Allow: /serie/
+Allow: /anime/
+Allow: /filmes
+Allow: /series
+Allow: /animes
+Allow: /canais
+Allow: /minha-lista
+Allow: /maratonas
+Allow: /sitemap*.xml
+Disallow: /api/
+Disallow: /api-*/
+Disallow: /_/
+
+# Search Engine Crawlers
+User-agent: Googlebot
+Allow: /
+
+User-agent: Googlebot-Image
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+
+User-agent: Baiduspider
+Allow: /
+
+User-agent: YandexBot
+Allow: /
+
+User-agent: facebookexternalhit
+Allow: /
+
+User-agent: Twitterbot
+Allow: /
+
+User-agent: TelegramBot
+Allow: /
+
+# Sitemap Index
+Sitemap: https://www.kairou.space/sitemap.xml

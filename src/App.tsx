@@ -14,11 +14,19 @@ import {
 } from './components/AccountModal';
 import { VipModal } from './components/VipModal';
 import { allowedForProfile } from './utils/profileRating';
+import { refreshPocketBase, clearPocketBaseSession, loadProfileState, saveProfileState } from './utils/pocketbase';
+import { useAnalytics } from './utils/useAnalytics';
 import { isAccountVip } from './utils/vipHelpers';
 import { SearchModal } from './components/SearchModal';
 import { SettingsModal } from './components/SettingsModal';
 import { TitleInfoView } from './components/TitleInfoView';
 import { TopNav, type NavSection } from './components/TopNav';
+import { LiveChannelsView } from './components/LiveChannelsView';
+import {
+  UrgentAnnouncementModal,
+  type UrgentAnnouncement,
+} from './components/UrgentAnnouncementModal';
+import { slugify } from './utils/slugify';
 import {
   DEFAULT_VAELOR_SETTINGS,
   type AnonymizedExtractResponse,
@@ -40,9 +48,24 @@ function readStorageJson<T>(key: string, fallback: T): T {
   }
 }
 
+function getInitialSection(): NavSection {
+  if (typeof window === 'undefined') return 'home';
+  const path = window.location.pathname.toLowerCase();
+  if (path.startsWith('/filmes') || path.startsWith('/movies')) return 'movies';
+  if (path.startsWith('/series') || path.startsWith('/shows')) return 'shows';
+  if (path.startsWith('/canais') || path.startsWith('/channels') || path.startsWith('/tv')) return 'channels';
+  if (path.startsWith('/minha-lista') || path.startsWith('/list')) return 'mylist';
+  const hash = (window.location.hash || '').replace('#/', '').toLowerCase();
+  if (hash.startsWith('movies') || hash.startsWith('filmes')) return 'movies';
+  if (hash.startsWith('series') || hash.startsWith('shows')) return 'shows';
+  if (hash.startsWith('canais') || hash.startsWith('channels')) return 'channels';
+  if (hash.startsWith('list') || hash.startsWith('minha-lista')) return 'mylist';
+  return 'home';
+}
+
 export default function App() {
   const [fullCatalog, setCatalog] = useState<MediaTitle[]>(CURATED_CATALOG);
-  const [activeSection, setActiveSection] = useState<NavSection>('home');
+  const [activeSection, setActiveSection] = useState<NavSection>(getInitialSection);
 
   // Selected Title -> Info View (triggers automatic background extraction)
   const [selectedTitle, setSelectedTitle] = useState<MediaTitle | null>(null);
@@ -70,13 +93,76 @@ export default function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [vipOpen, setVipOpen] = useState(false);
+  const [urgentAnnouncement, setUrgentAnnouncement] = useState<UrgentAnnouncement | null>(null);
   const [accountAction, setAccountAction] = useState<{ edit?: Profile; add?: boolean; manage?: boolean }>({});
-  const [account, setAccount] = useState<Account | null>(() => { const session = readStorageJson<{email: string}>('kairou_session_v1', { email: '' }); return readAccounts().find(a => a.email === session.email) || null; });
-  const [profile, setProfile] = useState<Profile | null>(() => { const session = readStorageJson<{email: string; profileId: string}>('kairou_session_v1', { email: '', profileId: '' }); return readAccounts().find(a => a.email === session.email)?.profiles.find(p => p.id === session.profileId) || null; });
+  const [account, setAccount] = useState<Account | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
   const isVip = isAccountVip(account);
+
+  useEffect(() => {
+    (window as unknown as { Kairou?: Record<string, unknown> }).Kairou = {
+      isVip: () => isVip,
+      openVip: () => setVipOpen(true),
+      currentUser: () => (account ? { ...account, is_vip: isVip, vip: isVip } : null),
+    };
+    (window as unknown as { __KAIROU_CURRENT_EMAIL__?: string | null }).__KAIROU_CURRENT_EMAIL__ =
+      account?.email || null;
+  }, [isVip, account]);
+
+  const currentRoute = useMemo(() => {
+    if (selectedTitle) {
+      const isAnime = Boolean(
+        selectedTitle.genres?.some((g) => /anim/i.test(g)) && (selectedTitle.originalLanguage === 'ja' || /japan/i.test(selectedTitle.country || ''))
+      );
+      const typePrefix = isAnime ? 'anime' : (selectedTitle.mediaType === 'series' ? 'serie' : 'filme');
+      const cleanSlug = slugify(selectedTitle.title);
+      return `/${typePrefix}/${selectedTitle.tmdbId || selectedTitle.id}${cleanSlug ? '-' + cleanSlug : ''}`;
+    }
+    if (activeSection === 'movies') return '/filmes';
+    if (activeSection === 'shows') return '/series';
+    if (activeSection === 'channels') return '/canais';
+    if (activeSection === 'mylist') return '/minha-lista';
+    return '/';
+  }, [selectedTitle, activeSection]);
+  useAnalytics(currentRoute);
+
+  const updateSeo = useCallback((opts: { title?: string; path?: string; push?: boolean }) => {
+    if (typeof window === 'undefined') return;
+    if (opts.title) document.title = opts.title;
+    if (opts.path && opts.push) {
+      if (window.location.pathname !== opts.path) {
+        window.history.pushState(null, '', opts.path);
+      }
+    }
+    const canonical = document.querySelector('link[rel="canonical"]');
+    if (canonical && opts.path) {
+      canonical.setAttribute('href', `https://www.kairou.space${opts.path === '/' ? '/' : opts.path}`);
+    }
+  }, []);
+
+  const navigateToSection = useCallback((sec: NavSection, push = true) => {
+    setSelectedTitle(null);
+    setActiveSection(sec);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    let path = '/';
+    let title = 'Kairou — Assistir Filmes, Séries e Animes Online Grátis em HD e 4K';
+    if (sec === 'movies') {
+      path = '/filmes';
+      title = profile?.kids ? 'Filmes Infantis — Kairou KIDS' : 'Filmes Online Dublados e Legendados em HD e 4K — Kairou';
+    } else if (sec === 'shows') {
+      path = '/series';
+      title = profile?.kids ? 'Desenhos & Séries — Kairou KIDS' : 'Séries Online Completas em HD e 4K — Kairou';
+    } else if (sec === 'mylist') {
+      path = '/minha-lista';
+      title = 'Minha Lista — Kairou';
+    }
+    updateSeo({ title, path, push });
+  }, [profile?.kids, updateSeo]);
   const catalog = useMemo(() => fullCatalog.filter(item => allowedForProfile(item, profile?.maxRating, profile?.kids)), [fullCatalog, profile]);
   const storageKey = (key: string, a = account, p = profile) => a && p ? `${key}:${encodeURIComponent(a.email)}:${p.id}` : key;
+  const [syncedProfile, setSyncedProfile] = useState<string | null>(null);
   const selectProfile = (next: Profile, current = account) => {
+    setSyncedProfile(null);
     if (!current) return;
     setProfile(next);
     localStorage.setItem('kairou_session_v1', JSON.stringify({ email: current.email, profileId: next.id }));
@@ -85,7 +171,7 @@ export default function App() {
     setContinueWatching(readStorageJson(storageKey(STORAGE_CONTINUE, current, next), []));
     setSelectedTitle(null); setActiveSection('home');
   };
-  const logout = () => { localStorage.removeItem('kairou_session_v1'); setAccount(null); setProfile(null); setMyListIds(readStorageJson(STORAGE_MYLIST, [])); setWatchedIds(readStorageJson(STORAGE_WATCHED, [])); setContinueWatching(readStorageJson(STORAGE_CONTINUE, [])); setSelectedTitle(null); setAccountOpen(false); };
+  const logout = () => { clearPocketBaseSession(); localStorage.removeItem('kairou_session_v1'); setAccount(null); setProfile(null); setMyListIds(readStorageJson(STORAGE_MYLIST, [])); setWatchedIds(readStorageJson(STORAGE_WATCHED, [])); setContinueWatching(readStorageJson(STORAGE_CONTINUE, [])); setSelectedTitle(null); setAccountOpen(false); };
 
   // Persisted user state
   const [myListIds, setMyListIds] = useState<string[]>(() => readStorageJson(storageKey(STORAGE_MYLIST), []));
@@ -97,10 +183,81 @@ export default function App() {
     readStorageJson(STORAGE_SETTINGS, DEFAULT_VAELOR_SETTINGS)
   );
 
-  // Fetch live TMDB PT-BR catalog on mount
+  // User requested: "toda vez q o user entrar no site pergunte qual conta ele quer usar"
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/catalog')
+
+    const initAuth = async () => {
+      let activeAccount: Account | null = null;
+
+      try {
+        const pbAccount = await refreshPocketBase();
+        if (pbAccount) {
+          updateStoredAccount(pbAccount);
+          activeAccount = pbAccount;
+        }
+      } catch {
+        // PocketBase offline or local mode
+      }
+
+      if (!activeAccount) {
+        const storedAccounts = readAccounts();
+        const session = readStorageJson<{ email?: string }>('kairou_session_v1', {});
+        const found =
+          (session.email ? storedAccounts.find((a) => a.email.toLowerCase() === session.email?.toLowerCase()) : null) ||
+          storedAccounts[0] ||
+          null;
+        if (found) {
+          activeAccount = found;
+        }
+      }
+
+      if (cancelled) return;
+
+      if (activeAccount) {
+        setAccount(activeAccount);
+      } else {
+        setAccount(null);
+      }
+
+      // Always ask user which account / profile to use every time they enter the site
+      setProfile(null);
+      setAccountAction({});
+      setAccountOpen(true);
+    };
+
+    void initAuth();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!account?.pbId || !profile?.id) { setSyncedProfile(null); return; }
+    let cancelled = false;
+    setSyncedProfile(null);
+    loadProfileState(profile.id).then(data => {
+      if (cancelled) return;
+      setMyListIds(data.saved); setWatchedIds(data.watched);
+      setContinueWatching(data.progress as WatchProgressEntry[]); setSyncedProfile(profile.id);
+    }).catch(() => { if (!cancelled) setSyncedProfile(null); });
+    return () => { cancelled = true; };
+  }, [account?.pbId, profile?.id]);
+
+  useEffect(() => {
+    if (!account?.pbId || !profile?.id || syncedProfile !== profile.id) return;
+    const timer = window.setTimeout(() => {
+      void saveProfileState(account.pbId!, profile.id, { saved:myListIds, watched:watchedIds, progress:continueWatching }).catch(() => {});
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [account?.pbId, profile?.id, syncedProfile, myListIds, watchedIds, continueWatching]);
+
+  // Fetch live TMDB PT-BR catalog on mount or when profile?.kids changes
+  useEffect(() => {
+    let cancelled = false;
+    const isKids = Boolean(profile?.kids);
+    fetch(`/api/catalog${isKids ? '?kids=true' : ''}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((json: { items?: MediaTitle[] } | null) => {
         if (!cancelled && json?.items && json.items.length > 0) {
@@ -110,6 +267,82 @@ export default function App() {
       .catch(() => {});
     return () => {
       cancelled = true;
+    };
+  }, [profile?.kids]);
+
+  useEffect(() => {
+    const isKids = Boolean(profile?.kids);
+    document.body.classList.toggle('is-kids-mode', isKids);
+    document.documentElement.classList.toggle('is-kids-mode', isKids);
+  }, [profile?.kids]);
+
+  // Fetch and manage urgent announcement (local-first + server sync + live updates)
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkAndSetAnnouncement = (ua: UrgentAnnouncement | null | undefined) => {
+      if (!ua || !ua.active) {
+        setUrgentAnnouncement(null);
+        return false;
+      }
+      try {
+        const dismissedId = localStorage.getItem('kairou_dismissed_urgent_id');
+        if (dismissedId === ua.id) return false;
+      } catch {
+        // ignore
+      }
+      setUrgentAnnouncement(ua);
+      return true;
+    };
+
+    // 1. LocalStorage checked immediately (local-first resilience)
+    try {
+      const localRaw = localStorage.getItem('kairou_urgent_announcement');
+      if (localRaw) {
+        const localUa = JSON.parse(localRaw) as UrgentAnnouncement;
+        checkAndSetAnnouncement(localUa);
+      }
+    } catch {
+      // ignore
+    }
+
+    // 2. Fetch from server endpoint
+    fetch('/api/vip/urgent-announcement')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { ok?: boolean; urgentAnnouncement?: UrgentAnnouncement | null } | null) => {
+        if (cancelled || !data?.urgentAnnouncement) return;
+        checkAndSetAnnouncement(data.urgentAnnouncement);
+      })
+      .catch(() => {});
+
+    // 3. Listen to live updates (when admin saves in the panel)
+    const handleUrgentUpdated = (e: Event) => {
+      const detail = (e as CustomEvent<UrgentAnnouncement>).detail;
+      if (detail && detail.active) {
+        setUrgentAnnouncement(detail);
+      } else {
+        setUrgentAnnouncement(null);
+      }
+    };
+
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'kairou_urgent_announcement') {
+        try {
+          const updated = e.newValue ? (JSON.parse(e.newValue) as UrgentAnnouncement) : null;
+          checkAndSetAnnouncement(updated);
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    window.addEventListener('kairou:urgent-updated', handleUrgentUpdated);
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener('kairou:urgent-updated', handleUrgentUpdated);
+      window.removeEventListener('storage', handleStorageChange);
     };
   }, []);
 
@@ -282,12 +515,10 @@ export default function App() {
           return;
         }
 
-        if (startJson.snapshot.streams.length > 0) {
-          setExtractState({
-            status: 'loading',
-            data: applyPreferenceOrder(startJson.snapshot),
-          });
-        }
+        setExtractState({
+          status: 'loading',
+          data: applyPreferenceOrder(startJson.snapshot),
+        });
 
         const es = new EventSource(`/api/extract/stream/${encodeURIComponent(startJson.jobId)}`);
         eventSourceRef.current = es;
@@ -315,9 +546,35 @@ export default function App() {
           }
         };
 
-        es.onerror = () => {
+        es.onerror = async () => {
           es.close();
           if (eventSourceRef.current === es) eventSourceRef.current = null;
+          // Fast fallback if SSE closed before streams populated
+          try {
+            const fallbackRes = await fetch('/api/extract', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                target,
+                imdbId: item.imdbId,
+                title: item.title,
+                originalTitle: item.originalTitle,
+                isAnime: isAnimeHint,
+              }),
+            });
+            if (fallbackRes.ok) {
+              const fbJson = (await fallbackRes.json()) as AnonymizedExtractResponse;
+              if (fbJson.streams?.length) {
+                setExtractState({
+                  status: 'ready',
+                  data: applyPreferenceOrder(fbJson),
+                });
+                return;
+              }
+            }
+          } catch {
+            // ignore
+          }
           setExtractState((curr) => ({
             ...curr,
             status: curr.data?.streams?.length ? 'ready' : 'error',
@@ -337,7 +594,7 @@ export default function App() {
 
   // Open Title Info View (always routes to Info Page first and prepares playback in parallel!)
   const openTitleInfo = useCallback(
-    async (rawItem: MediaTitle, resume = false) => {
+    async (rawItem: MediaTitle, resume = false, pushUrl = true) => {
       const existingProgress = continueWatching.find((c) => c.item.id === rawItem.id);
       const initSeason = existingProgress?.season ?? rawItem.defaultSeason ?? 1;
       const initEpisode = existingProgress?.episode ?? rawItem.defaultEpisode ?? 1;
@@ -348,6 +605,22 @@ export default function App() {
       setPlayerActive(false);
       setPlayerResumeAtSec(resume && existingProgress ? existingProgress.currentTime : 0);
       window.scrollTo({ top: 0, behavior: 'smooth' });
+
+      // Canonical SEO Title & Path matching REA / Google Search Console
+      const isAnime = Boolean(
+        rawItem.genres?.some((g) => /anim/i.test(g)) && (rawItem.originalLanguage === 'ja' || /japan/i.test(rawItem.country || ''))
+      );
+      const typePrefix = isAnime ? 'anime' : (rawItem.mediaType === 'series' ? 'serie' : 'filme');
+      const cleanSlug = slugify(rawItem.title);
+      const titlePath = `/${typePrefix}/${rawItem.tmdbId || rawItem.id}${cleanSlug ? '-' + cleanSlug : ''}`;
+      const year = rawItem.year || '';
+      let docTitle = `Assistir ${rawItem.title} (${year}) Online Dublado e Legendado HD e 4K — Kairou`;
+      if (isAnime) {
+        docTitle = `Assistir ${rawItem.title} Online Dublado e Legendado HD — Kairou`;
+      } else if (rawItem.mediaType === 'series') {
+        docTitle = `Assistir ${rawItem.title} Todas as Temporadas Online Dublado e Legendado — Kairou`;
+      }
+      updateSeo({ title: docTitle, path: titlePath, push: pushUrl });
 
       // Start preparing streams immediately
       if (rawItem.tmdbId) {
@@ -381,8 +654,62 @@ export default function App() {
         setIsLoadingMeta(false);
       }
     },
-    [continueWatching, runAutoExtraction]
+    [continueWatching, runAutoExtraction, updateSeo]
   );
+
+  // Resolve server-rendered title URLs when a visitor opens a shared link or presses Back/Forward.
+  const initialTitleLoaded = useRef(false);
+  useEffect(() => {
+    const handleUrlNavigation = (isInitial = false) => {
+      const pathname = window.location.pathname;
+      const match = pathname.match(/^\/(filme|movie|serie|tv|anime)\/([a-zA-Z0-9_:-]+?)(?:-[^/]*)?\/?$/i);
+      const hashMatch = (window.location.hash || '').match(/^#\/title\/(movie|tv):([a-zA-Z0-9_:-]+)/i);
+
+      if (match || hashMatch) {
+        const rawType = match ? match[1] : hashMatch![1];
+        const rawId = match ? match[2] : hashMatch![2];
+        const types = /^(filme|movie)$/i.test(rawType) ? ['movie'] : /^anime$/i.test(rawType) ? ['series', 'movie'] : ['series'];
+        void (async () => {
+          for (const type of types) {
+            try {
+              const response = await fetch(`/api/title/${type}/${rawId}`);
+              if (!response.ok) continue;
+              const data = (await response.json()) as { item?: MediaTitle };
+              if (data.item) {
+                void openTitleInfo(data.item, false, false);
+                return;
+              }
+            } catch {
+              /* Try the other media type */
+            }
+          }
+        })();
+        return;
+      }
+
+      if (!isInitial) {
+        const p = pathname.toLowerCase();
+        if (p.startsWith('/filmes') || p.startsWith('/movies')) {
+          navigateToSection('movies', false);
+        } else if (p.startsWith('/series') || p.startsWith('/shows')) {
+          navigateToSection('shows', false);
+        } else if (p.startsWith('/minha-lista') || p.startsWith('/list')) {
+          navigateToSection('mylist', false);
+        } else {
+          navigateToSection('home', false);
+        }
+      }
+    };
+
+    if (!initialTitleLoaded.current) {
+      initialTitleLoaded.current = true;
+      handleUrlNavigation(true);
+    }
+
+    const onPopState = () => handleUrlNavigation(false);
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [openTitleInfo, navigateToSection]);
 
   const handleSelectSeasonEpisode = async (s: number, e: number, autoLaunch = false) => {
     setSelectedSeason(s);
@@ -432,13 +759,10 @@ export default function App() {
           activeSection={activeSection}
           showBack={Boolean(selectedTitle)}
           onBack={() => {
-            setSelectedTitle(null);
-            window.scrollTo({ top: 0, behavior: 'smooth' });
+            navigateToSection(activeSection, true);
           }}
           onSelectSection={(sec) => {
-            setSelectedTitle(null);
-            setActiveSection(sec);
-            window.scrollTo({ top: 0, behavior: 'smooth' });
+            navigateToSection(sec, true);
           }}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenAccount={() => { if (account && profile) setAccountMenuOpen(v => !v); else { setAccountAction({}); setAccountOpen(true); } }}
@@ -463,6 +787,9 @@ export default function App() {
             void runAutoExtraction(selectedTitle, selectedSeason, selectedEpisode, true)
           }
           onLaunchPlayer={(idx = 0) => {
+            if (!extractState.data?.streams?.length) {
+              void runAutoExtraction(selectedTitle, selectedSeason, selectedEpisode, false);
+            }
             setPlayerStreamIndex(idx);
             setPlayerActive(true);
           }}
@@ -483,30 +810,42 @@ export default function App() {
             myListIds={myListIds}
             onOpenInfo={(item, resume) => void openTitleInfo(item, resume)}
             onRemoveContinue={removeContinueItem}
+            onGoToChannels={() => navigateToSection('channels', true)}
+            isKids={Boolean(profile?.kids)}
           />
         </>
       ) : activeSection === 'movies' ? (
         <CatalogGridView
-          title="Filmes"
-          subtitle="Destaques em cinema, 4K UHD e lançamentos dublados em PT-BR."
+          title={profile?.kids ? 'Filmes Infantis' : 'Filmes'}
           items={catalog}
           mediaTypeFilter="movie"
+          isKids={Boolean(profile?.kids)}
+          myListIds={myListIds}
+          onToggleMyList={toggleMyList}
           onOpenInfo={(item) => void openTitleInfo(item)}
         />
       ) : activeSection === 'shows' ? (
         <CatalogGridView
-          title="Séries"
-          subtitle="Temporadas completas com áudio PT-BR, original e legendas sincronizadas."
+          title={profile?.kids ? 'Desenhos & Séries' : 'Séries'}
           items={catalog}
           mediaTypeFilter="series"
+          isKids={Boolean(profile?.kids)}
+          myListIds={myListIds}
+          onToggleMyList={toggleMyList}
           onOpenInfo={(item) => void openTitleInfo(item)}
+        />
+      ) : activeSection === 'channels' ? (
+        <LiveChannelsView
+          onBack={() => navigateToSection('home', true)}
+          isVip={isVip}
         />
       ) : (
         <CatalogGridView
           title="Minha Lista"
-          subtitle="Seus filmes e séries salvos para assistir quando quiser."
           items={myListItems}
           mediaTypeFilter="all"
+          myListIds={myListIds}
+          onToggleMyList={toggleMyList}
           emptyMessage="Sua lista ainda está vazia. Clique no botão + em qualquer título para salvá-lo aqui."
           onOpenInfo={(item) => void openTitleInfo(item)}
         />
@@ -514,6 +853,8 @@ export default function App() {
 
       {playerActive && selectedTitle && (
         <CinemaPlayer
+          isVip={isVip}
+          onRequireVip={() => setVipOpen(true)}
           key={`${selectedTitle.id}-s${selectedSeason}-e${selectedEpisode}`}
           item={selectedTitle}
           season={selectedTitle.mediaType === 'series' ? selectedSeason : undefined}
@@ -600,7 +941,12 @@ export default function App() {
           initialManage={accountAction.manage}
           account={account}
           profile={profile}
-          onClose={() => setAccountOpen(false)}
+          onClose={() => {
+            setAccountOpen(false);
+            if (!profile && account && account.profiles.length > 0) {
+              selectProfile(account.profiles[0]);
+            }
+          }}
           onOpenVip={() => setVipOpen(true)}
           onAccount={(next) => {
             setAccount(next);
@@ -642,6 +988,33 @@ export default function App() {
         }}
         onClose={() => setSettingsOpen(false)}
       />
+
+      {urgentAnnouncement && profile && !accountOpen && (
+        <UrgentAnnouncementModal
+          announcement={urgentAnnouncement}
+          onClose={() => setUrgentAnnouncement(null)}
+        />
+      )}
+
+      {/* Floating Telegram bubble replacing scroll-to-top button */}
+      {!selectedTitle && !playerActive && activeSection !== 'channels' && (
+        <a
+          href="https://t.me/+MIU924pI1MoyYTRk"
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Canal do Telegram"
+          title="Canal do Telegram"
+          className="fixed bottom-6 right-6 z-30 w-10 h-10 rounded-full bg-white/15 hover:bg-[#229ED9] hover:border-[#229ED9] backdrop-blur-md border border-white/20 text-white flex items-center justify-center transition-all duration-200 cursor-pointer shadow-xl group"
+        >
+          <svg
+            className="w-5 h-5 fill-current group-hover:scale-110 transition-transform duration-200"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" />
+          </svg>
+        </a>
+      )}
     </div>
   );
 }

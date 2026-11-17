@@ -1,8 +1,44 @@
-import React, { useState } from 'react';
-import { ArrowUp, ChevronRight, Pencil, Play, Star, Trash2 } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Pencil,
+  Play,
+  Radio,
+  Sparkles,
+  Star,
+  Trash2,
+  Trophy,
+  Tv,
+} from 'lucide-react';
 import type { MediaTitle } from '../data/curatedCatalog';
 import { useScrollReveal } from '../utils/useScrollReveal';
 import { formatRemainingMinutes } from '../utils/streamLogic';
+
+function ScrollRail({ children, className }: { children: React.ReactNode; className: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = useState({ left: false, right: false });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => {
+      if (el.scrollTop !== 0) el.scrollTop = 0;
+      setEdges({ left: el.scrollLeft > 2, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 2 });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    if (el.firstElementChild) observer.observe(el.firstElementChild);
+    el.addEventListener('scroll', update, { passive: true });
+    return () => { observer.disconnect(); el.removeEventListener('scroll', update); };
+  }, [children]);
+  const move = (direction: number) => { const el = ref.current; if (el) el.scrollBy({ left: direction * el.clientWidth * .8, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); };
+  return <div className="kairou-rail relative group/rail">
+    <div ref={ref} className={className}>{children}</div>
+    {edges.left && <button type="button" aria-label="Rolar para a esquerda" onClick={() => move(-1)} className="rail-arrow left-0"><ChevronLeft size={20}/></button>}
+    {edges.right && <button type="button" aria-label="Rolar para a direita" onClick={() => move(1)} className="rail-arrow right-0"><ChevronRight size={20}/></button>}
+  </div>;
+}
 
 export interface WatchProgressEntry {
   item: MediaTitle;
@@ -19,6 +55,8 @@ interface HomeBrowseViewProps {
   myListIds: string[];
   onOpenInfo: (item: MediaTitle, resume?: boolean) => void;
   onRemoveContinue: (id: string) => void;
+  onGoToChannels?: () => void;
+  isKids?: boolean;
 }
 
 export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
@@ -26,18 +64,48 @@ export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
   continueWatching,
   onOpenInfo,
   onRemoveContinue,
+  onGoToChannels,
+  isKids = false,
 }) => {
   const [editContinue, setEditContinue] = useState(false);
   const [failedImg, setFailedImg] = useState<Record<string, boolean>>({});
 
   const revealRef = useScrollReveal<HTMLDivElement>([catalog, continueWatching]);
   const top10 = catalog.slice(0, 10);
-  const trendingNow = catalog.slice(0, 20);
-  const seriesItems = catalog.filter((i) => i.mediaType === 'series');
-  const movieItems = catalog.filter((i) => i.mediaType === 'movie');
-  const actionSciFi = catalog.filter((i) =>
-    i.genres.some((g) => /ação|ficção|aventura/i.test(g))
-  );
+  const top10Ids = new Set(top10.map((i) => i.id));
+
+  const animMovies = catalog.filter((i) => i.genres.some((g) => /animação|animacao/i.test(g)));
+  const kidsSeries = catalog.filter((i) => i.mediaType === 'series');
+  const familyMovies = catalog.filter((i) => i.mediaType === 'movie' && i.genres.some((g) => /família|familia|aventura/i.test(g)));
+  const kidsAnimes = catalog.filter((i) => i.genres.some((g) => /anime/i.test(g)) || /japão|japan|naruto|one piece|dragon|avatar|totoro|ghibli|pokemon/i.test(i.title + i.originalTitle));
+
+  // Deduplicate rails so each row shows varied, fresh items without repeating the rows above it
+  const trendingFiltered = catalog.filter((i) => !top10Ids.has(i.id));
+  const rail1Items = isKids ? (animMovies.length >= 2 ? animMovies : catalog.slice(0, 20)) : (trendingFiltered.length >= 10 ? trendingFiltered : catalog).slice(0, 20);
+
+  const rail1Ids = new Set(rail1Items.map((i) => i.id));
+  const seenIds1 = new Set([...top10Ids, ...rail1Ids]);
+
+  const seriesFiltered = catalog.filter((i) => i.mediaType === 'series' && !seenIds1.has(i.id));
+  const rail2Items = isKids
+    ? (kidsSeries.length >= 2 ? kidsSeries : catalog.filter((i) => i.mediaType === 'series').slice(0, 20))
+    : (seriesFiltered.length >= 10 ? seriesFiltered : catalog.filter((i) => i.mediaType === 'series')).slice(0, 20);
+
+  const rail2Ids = new Set(rail2Items.map((i) => i.id));
+  const seenIds2 = new Set([...seenIds1, ...rail2Ids]);
+
+  const moviesFiltered = catalog.filter((i) => i.mediaType === 'movie' && !seenIds2.has(i.id));
+  const rail3Items = isKids
+    ? (familyMovies.length >= 2 ? familyMovies : catalog.filter((i) => i.mediaType === 'movie').slice(0, 20))
+    : (moviesFiltered.length >= 10 ? moviesFiltered : catalog.filter((i) => i.mediaType === 'movie')).slice(0, 20);
+
+  const rail3Ids = new Set(rail3Items.map((i) => i.id));
+  const seenIds3 = new Set([...seenIds2, ...rail3Ids]);
+
+  const actionFiltered = catalog.filter((i) => i.genres.some((g) => /ação|ficção|aventura|action|sci-fi/i.test(g)) && !seenIds3.has(i.id));
+  const rail4Items = isKids
+    ? (kidsAnimes.length >= 2 ? kidsAnimes : catalog.slice(10, 30))
+    : (actionFiltered.length >= 8 ? actionFiltered : catalog.filter((i) => i.genres.some((g) => /ação|ficção|aventura|action|sci-fi/i.test(g)))).slice(0, 20);
 
   return (
     <div ref={revealRef} className="w-full px-5 sm:px-10 pb-20 pt-8 space-y-12">
@@ -66,7 +134,7 @@ export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
             </button>
           </div>
 
-          <div className="flex gap-4 overflow-x-auto overflow-y-visible overscroll-x-contain pb-2 no-scrollbar">
+          <ScrollRail className="flex gap-4 overflow-x-auto overflow-y-hidden overscroll-x-contain pt-2 pb-4 no-scrollbar">
             {continueWatching.map((entry) => {
               const pct =
                 entry.duration > 0
@@ -130,17 +198,17 @@ export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
                 </article>
               );
             })}
-          </div>
+          </ScrollRail>
         </section>
       )}
 
       {/* Top 10 Today with Giant Hollow Outlined Numbers */}
       <section aria-labelledby="top10-heading" className="space-y-5">
         <h2 id="top10-heading" className="font-display text-lg sm:text-xl font-bold text-white">
-          Top 10 hoje no Kairou
+          {isKids ? 'Top 10 da Garotada' : 'Top 10 hoje no Kairou'}
         </h2>
 
-        <div className="flex gap-6 sm:gap-8 overflow-x-auto overflow-y-visible overscroll-x-contain pb-4 pl-2 no-scrollbar">
+        <ScrollRail className="flex gap-6 sm:gap-8 overflow-x-auto overflow-y-hidden overscroll-x-contain pt-4 pb-4 pl-2 no-scrollbar">
           {top10.map((item, idx) => {
             const rank = idx + 1;
             const posterSrc = failedImg[`t10-${item.id}`]
@@ -158,11 +226,11 @@ export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
               >
                 <span
                   aria-hidden="true"
-                  className="rank-outline absolute left-0 bottom-0 text-[105px] sm:text-[132px] pointer-events-none transition-transform duration-200 group-hover:scale-105"
+                  className="rank-outline absolute left-0 bottom-0 text-[105px] sm:text-[132px] pointer-events-none transition-transform duration-200 group-hover:scale-105 origin-bottom-left select-none"
                 >
                   {rank}
                 </span>
-                <div className="relative z-10 w-[142px] sm:w-[190px] xl:w-[208px] aspect-[2/3] rounded-xl overflow-hidden bg-stone-900 border border-white/10 shadow-xl transition-transform duration-200 group-hover:-translate-y-1">
+                <div className="relative z-10 w-[142px] sm:w-[190px] xl:w-[208px] aspect-[2/3] rounded-xl overflow-hidden bg-stone-900 border border-white/10 shadow-xl transition-transform duration-200 group-hover:-translate-y-1.5">
                   <img
                     src={posterSrc}
                     alt={item.title}
@@ -174,54 +242,90 @@ export const HomeBrowseView: React.FC<HomeBrowseViewProps> = ({
               </button>
             );
           })}
-        </div>
+        </ScrollRail>
       </section>
 
-      {/* Live TMDB Em Alta Agora Rail */}
+      {/* Live Channels Showcase Banner (Below Top 10) */}
+      {!isKids && onGoToChannels && (
+        <section aria-label="Canais Ao Vivo Kairou" className="w-full">
+          <div className="relative overflow-hidden rounded-2xl sm:rounded-3xl bg-gradient-to-r from-sky-950/40 via-[#10141E] to-[#0A0D14] border border-white/10 hover:border-sky-500/30 p-5 sm:p-8 lg:p-10 shadow-2xl transition-all duration-300">
+            {/* Ambient Background Glow */}
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute -right-20 -top-20 h-64 w-64 rounded-full bg-sky-500/10 blur-3xl"
+            />
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute -left-20 -bottom-20 h-64 w-64 rounded-full bg-blue-600/10 blur-3xl"
+            />
+
+            <div className="relative z-10 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+              {/* Left Column: Copy */}
+              <div className="max-w-2xl space-y-2 sm:space-y-3">
+                <h3 className="font-display text-2xl sm:text-3xl lg:text-4xl font-extrabold text-white tracking-tight leading-tight">
+                  Canais de TV Ao Vivo em HD e 4K
+                </h3>
+
+                <p className="text-xs sm:text-sm text-stone-300 leading-relaxed">
+                  Futebol ao vivo com Premiere, SporTV, ESPN e CazéTV, além dos principais canais abertos, Telecine, HBO e infantis. Sem travamentos e com a melhor resolução direto no player.
+                </p>
+              </div>
+
+              {/* Right Column: CTA Button */}
+              <div className="flex flex-col sm:flex-row lg:flex-col items-start lg:items-end gap-3 shrink-0 pt-2 lg:pt-0">
+                <button
+                  type="button"
+                  onClick={onGoToChannels}
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2.5 px-6 sm:px-8 py-3.5 rounded-full bg-white text-stone-950 font-display font-bold text-sm hover:bg-stone-200 active:scale-[0.98] transition-all cursor-pointer shadow-lg hover:shadow-white/10"
+                >
+                  <Tv className="w-4 h-4 text-stone-950" />
+                  <span>Assistir Canais Ao Vivo</span>
+                  <ChevronRight className="w-4 h-4 text-stone-600" />
+                </button>
+                <span className="text-[11px] text-stone-400 font-medium pl-1 sm:pl-0">
+                  Mais de 140 canais disponíveis gratuitamente
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Rail 1 */}
       <section aria-labelledby="trending-heading" className="space-y-4">
         <h2 id="trending-heading" className="font-display text-lg sm:text-xl font-bold text-white flex items-center gap-1.5">
-          Em Alta Agora
+          {isKids ? 'Filmes de Animação Incríveis' : 'Em Alta Agora'}
           <ChevronRight className="w-4 h-4 text-stone-400" strokeWidth={1.75} />
         </h2>
-        <PosterRail items={trendingNow} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
+        <PosterRail items={rail1Items} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
       </section>
 
-      {/* Series Rail */}
+      {/* Rail 2 */}
       <section aria-labelledby="series-heading" className="space-y-4">
         <h2 id="series-heading" className="font-display text-lg sm:text-xl font-bold text-white flex items-center gap-1.5">
-          Séries em Alta
+          {isKids ? 'Desenhos e Séries Infantis' : 'Séries em Alta'}
           <ChevronRight className="w-4 h-4 text-stone-400" strokeWidth={1.75} />
         </h2>
-        <PosterRail items={seriesItems} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
+        <PosterRail items={rail2Items} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
       </section>
 
-      {/* Filmes Populares Rail */}
+      {/* Rail 3 */}
       <section aria-labelledby="movies-heading" className="space-y-4">
         <h2 id="movies-heading" className="font-display text-lg sm:text-xl font-bold text-white flex items-center gap-1.5">
-          Filmes Populares
+          {isKids ? 'Aventura e Magia em Família' : 'Filmes Populares'}
           <ChevronRight className="w-4 h-4 text-stone-400" strokeWidth={1.75} />
         </h2>
-        <PosterRail items={movieItems} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
+        <PosterRail items={rail3Items} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
       </section>
 
-      {/* Action & Sci-Fi Rail */}
+      {/* Rail 4 */}
       <section aria-labelledby="scifi-heading" className="space-y-4">
         <h2 id="scifi-heading" className="font-display text-lg sm:text-xl font-bold text-white flex items-center gap-1.5">
-          Ação &amp; Ficção Científica
+          {isKids ? 'Animes para Toda a Família' : 'Ação & Ficção Científica'}
           <ChevronRight className="w-4 h-4 text-stone-400" strokeWidth={1.75} />
         </h2>
-        <PosterRail items={actionSciFi} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
+        <PosterRail items={rail4Items} failedImg={failedImg} setFailedImg={setFailedImg} onOpenInfo={onOpenInfo} />
       </section>
-
-      {/* Floating scroll-to-top button */}
-      <button
-        type="button"
-        onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-        aria-label="Voltar ao topo"
-        className="fixed bottom-6 right-6 z-30 w-10 h-10 rounded-full bg-white/15 hover:bg-white/25 backdrop-blur-md border border-white/20 text-white flex items-center justify-center transition-all duration-150 cursor-pointer"
-      >
-        <ArrowUp className="w-4 h-4" strokeWidth={1.75} />
-      </button>
     </div>
   );
 };
@@ -240,7 +344,7 @@ const PosterRail: React.FC<PosterRailProps> = ({
   onOpenInfo,
 }) => {
   return (
-    <div className="flex gap-4 overflow-x-auto overflow-y-visible overscroll-x-contain pb-2 no-scrollbar">
+    <ScrollRail className="flex gap-4 overflow-x-auto overflow-y-hidden overscroll-x-contain pt-3 pb-4 no-scrollbar">
       {items.map((item) => {
         const posterSrc = failedImg[`rail-${item.id}`]
           ? '/src/assets/images/poster_metro_hospital_1794566232848.jpg'
@@ -254,7 +358,7 @@ const PosterRail: React.FC<PosterRailProps> = ({
             onClick={() => onOpenInfo(item)}
             className="group w-[148px] sm:w-[190px] xl:w-[208px] shrink-0 text-left space-y-2 cursor-pointer focus-visible:outline-2 focus-visible:outline-white rounded-xl"
           >
-            <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-stone-900 border border-white/10 transition-transform duration-200 group-hover:-translate-y-1">
+            <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-stone-900 border border-white/10 transition-transform duration-200 group-hover:-translate-y-1.5 shadow-md group-hover:shadow-xl">
               <img
                 src={posterSrc}
                 alt={item.title}
@@ -275,6 +379,6 @@ const PosterRail: React.FC<PosterRailProps> = ({
           </button>
         );
       })}
-    </div>
+    </ScrollRail>
   );
 };

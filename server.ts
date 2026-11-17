@@ -1,11 +1,15 @@
 import crypto from 'node:crypto';
+import { createPocketBaseRouter } from './server/pocketbase.ts';
+import { createAnalyticsRouter, recordVisit } from './server/analytics.ts';
+import { createVipRouter } from './server/vipRoutes.ts';
+import { getSharedCache, setSharedCache } from './server/sharedCache.ts';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import dotenv from 'dotenv';
 import express from 'express';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +21,12 @@ import {
   type EpisodeItem,
   type MediaTitle,
 } from './src/data/curatedCatalog.ts';
+import {
+  LIVE_CHANNELS,
+  CHANNEL_CATEGORIES,
+  type LiveChannel,
+} from './src/data/liveChannels.ts';
+import { allowedForProfile } from './src/utils/profileRating.ts';
 import {
   convertSrtToVtt,
   detectMp4CodecFromBytes,
@@ -44,7 +54,7 @@ import {
   pickTopAnimeCandidates,
 } from './src/utils/animeMatcher.ts';
 
-const PORT = Number(process.env.PORT ?? 3000);
+const PORT = Number(process.env.PORT ?? 3001);
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -813,7 +823,7 @@ async function extractMultiNodePipeline(
   return { streams, subtitles };
 }
 
-// Horcrux Direct (https://stream.hls.lol/q62) — ~90-255ms FHD/4K HLS
+// Horcrux Direct (https://stream.hls.lol/q62) — ~90-255ms FHD/4K HLS + Subtitles
 async function extractHorcruxPipeline(
   target: ExtractTarget,
   timeoutMs = 1500
@@ -824,9 +834,12 @@ async function extractHorcruxPipeline(
       : `https://stream.hls.lol/q62?tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}`;
   try {
     const res = await fetchWithTimeout(url, {
-      referer: 'https://stream.hls.lol/',
+      referer: 'https://atlantic.bz/',
       timeoutMs,
-      headers: { Accept: 'application/json' },
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      },
     });
     if (res.status !== 200) return { streams: [], subtitles: [] };
     const json = JSON.parse(res.text) as {
@@ -836,11 +849,14 @@ async function extractHorcruxPipeline(
         height?: number;
         audioLocales?: string[];
         master?: string;
+        dash?: string;
+        subtitles?: Array<{ locale?: string; lang?: string; url: string }>;
       }>;
     };
     const streams: InternalExtractedStream[] = [];
+    const subtitles: InternalSubtitle[] = [];
     for (const rel of json.releases ?? []) {
-      const mUrl = rel.master;
+      const mUrl = rel.master || rel.dash;
       if (!mUrl || !mUrl.startsWith('http')) continue;
       const locales = (rel.audioLocales ?? []).join(' ');
       const isPt = /\b(pt|pt-br|pb|por|brazil)\b/i.test(`${locales} ${rel.title ?? ''}`);
@@ -854,17 +870,31 @@ async function extractHorcruxPipeline(
             : '720p';
       streams.push({
         rawUrl: mUrl,
-        referer: 'https://stream.hls.lol/',
-        format: 'hls',
+        referer: 'https://atlantic.bz/',
+        format: mUrl.includes('.mp4') ? 'mp4' : 'hls',
         codec: 'h264',
         idioma: isPt ? 'pt-br' : rel.audioLocales?.[0] ?? 'en-us',
         qualidade: quality,
         isPtBr: isPt,
         is4k,
-        priorityBoost: isPt ? 48 : 26,
+        priorityBoost: isPt ? 55 : 32,
       });
+
+      // Parse embedded subtitles
+      for (const sub of rel.subtitles ?? []) {
+        if (sub.url && sub.url.startsWith('http')) {
+          const lcode = (sub.locale || sub.lang || 'pt-BR').toLowerCase();
+          const isPtSub = /\b(pt|pt-br|pb|por|brazil)\b/i.test(lcode);
+          subtitles.push({
+            rawUrl: sub.url,
+            referer: 'https://atlantic.bz/',
+            lang: isPtSub ? 'pt-br' : lcode,
+            label: isPtSub ? 'Português (Brasil)' : lcode.toUpperCase(),
+          });
+        }
+      }
     }
-    return { streams, subtitles: [] };
+    return { streams, subtitles };
   } catch {
     return { streams: [], subtitles: [] };
   }
@@ -963,7 +993,7 @@ async function extractStremioAddon(
     const seenUrls = new Set<string>();
     const seenSubs = new Set<string>();
 
-    const candidates = items.slice(0, 8);
+    const candidates = items.slice(0, 32);
     await Promise.allSettled(
       candidates.map(async (st, idx) => {
         if (!st.url || !st.url.startsWith('http')) return;
@@ -1626,6 +1656,17 @@ async function verifyStreamCandidate(
 ): Promise<InternalExtractedStream | null> {
   if (!isSafeExternalUrl(st.rawUrl)) return null;
 
+  // FenixFlix streams use dynamic redirect tokens (/r/...) which must not be dropped by probe timeouts
+  if (st.rawUrl.includes('fenixhub.online') || st.rawUrl.includes('fenixflix')) {
+    return {
+      ...st,
+      format: 'mp4',
+      codec: st.codec || 'h264',
+      verified: true,
+      latencyMs: 120,
+    };
+  }
+
   const t0 = Date.now();
   const baseHeaders: Record<string, string> = {
     'User-Agent': DEFAULT_UA,
@@ -1869,8 +1910,8 @@ function buildAnonymizedSnapshot(
 
   // Keep H.264 verified servers first; cap HEVC entries to 2 at the very bottom if H.264 exists
   const h264Only = ranked.filter((r) => r.codec !== 'h265');
-  const hevcTail = ranked.filter((r) => r.codec === 'h265').slice(0, h264Only.length > 0 ? 2 : 6);
-  const curatedSelection = [...h264Only, ...hevcTail].slice(0, 24);
+  const hevcTail = ranked.filter((r) => r.codec === 'h265');
+  const curatedSelection = [...h264Only, ...hevcTail].slice(0, 64);
 
   const anonymizedStreams: AnonymizedStream[] = curatedSelection.map((item, idx) => {
     const streamId = registerStream(item.rawUrl, item.referer, item.format, item.extraHeaders);
@@ -1958,21 +1999,7 @@ function launchAllPipelines(
     runAndVerify(extractPlayerFlixPipeline(parsed, 1600)),
   ];
 
-  if (parsed.kind === 'tv') {
-    tier1Tasks.push(
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://fenixflix.fenixhub.online',
-          endpointPath: `/stream/series/tmdb:${parsed.tmdbId}:${parsed.season}:${parsed.episode}.json`,
-          referer: 'https://fenixflix.fenixhub.online/',
-          timeoutMs: 2000,
-          priorityBoost: 58,
-          defaultPtBr: true,
-        })
-      )
-    );
-  }
-
+  // FenixFlix relies strictly on IMDb IDs (tt...) for both movies and series in Tier 2 below
   // Launch IMDb-based Stremio pipelines the instant imdbPromise resolves (~0-180ms)
   const tier2Task = imdbPromise.then(async (imdbId) => {
     if (!imdbId) return;
@@ -2033,14 +2060,14 @@ function launchAllPipelines(
       ),
     ];
 
-    if (parsed.kind === 'movie') {
+    {
       imdbTasks.push(
         runAndVerify(
           extractStremioAddon({
             baseUrl: 'https://fenixflix.fenixhub.online',
             endpointPath: epPath,
             referer: 'https://fenixflix.fenixhub.online/',
-            timeoutMs: 1900,
+            timeoutMs: 7500,
             priorityBoost: 60,
             defaultPtBr: true,
           })
@@ -2137,6 +2164,12 @@ function mapTmdbSummaryToMediaTitle(raw: Record<string, unknown>, forceType?: 'm
   const posterPath = typeof raw.poster_path === 'string' ? `${TMDB_IMG}/w500${raw.poster_path}` : '';
   const backdropPath = typeof raw.backdrop_path === 'string' ? `${TMDB_IMG}/w1280${raw.backdrop_path}` : posterPath;
 
+  const isKidFriendly =
+    genres.some((g) => /animação|família|kids|infantil/i.test(g)) ||
+    genreIds.includes(16) ||
+    genreIds.includes(10751) ||
+    genreIds.includes(10762);
+
   return {
     id: `tmdb-${type}-${tmdbId}`,
     imdbId: '',
@@ -2148,7 +2181,7 @@ function mapTmdbSummaryToMediaTitle(raw: Record<string, unknown>, forceType?: 'm
     runtime: type === 'series' ? '45m / ep' : '2h 00m',
     runtimeMinutes: type === 'series' ? 45 : 120,
     rating: vote,
-    ageRating: raw.adult ? '18' : '14',
+    ageRating: raw.adult ? '18' : isKidFriendly ? 'L' : '14',
     qualityBadge: '4K UHD',
     audioBadge: 'PT-BR · Dual Áudio',
     genres,
@@ -2344,15 +2377,163 @@ async function fetchTmdbHeroLogo(type: 'movie' | 'series', tmdbId: string): Prom
   return pick?.file_path ? `${TMDB_IMG}/w500${pick.file_path}` : undefined;
 }
 
+interface BrowseCatalogParams {
+  mediaType: 'movie' | 'series';
+  isKids: boolean;
+  page: number;
+  genre?: string;
+  sort?: string;
+}
+
+interface BrowseCatalogResult {
+  items: MediaTitle[];
+  page: number;
+  totalPages: number;
+  hasMore: boolean;
+}
+
+const TMDB_MOVIE_GENRE_MAP: Record<string, string> = {
+  'ação': '28',
+  'acao': '28',
+  'aventura': '12',
+  'comédia': '35',
+  'comedia': '35',
+  'terror': '27',
+  'ficção científica': '878',
+  'ficcao cientifica': '878',
+  'drama': '18',
+  'animação': '16',
+  'animacao': '16',
+  'romance': '10749',
+  'suspense': '53',
+  'crime': '80',
+  'fantasia': '14',
+  'família': '10751',
+  'familia': '10751',
+};
+
+const TMDB_TV_GENRE_MAP: Record<string, string> = {
+  'drama': '18',
+  'ação': '10759',
+  'acao': '10759',
+  'ação & aventura': '10759',
+  'comédia': '35',
+  'comedia': '35',
+  'ficção científica': '10765',
+  'sci-fi & fantasia': '10765',
+  'suspense': '9648',
+  'mistério': '9648',
+  'misterio': '9648',
+  'crime': '80',
+  'animação': '16',
+  'animacao': '16',
+  'desenhos': '16',
+  'documentário': '99',
+  'documentario': '99',
+  'kids': '10762',
+  'infantil': '10762',
+  'família': '10751',
+  'familia': '10751',
+};
+
+async function fetchPaginatedCatalog(params: BrowseCatalogParams): Promise<BrowseCatalogResult> {
+  const { mediaType, isKids, page = 1, genre = '', sort = 'popular' } = params;
+  const tmdbType = mediaType === 'series' ? 'tv' : 'movie';
+  const genreLower = genre.toLowerCase();
+
+  let sortQuery = 'sort_by=popularity.desc';
+  if (sort === 'rating') {
+    sortQuery = mediaType === 'movie'
+      ? 'sort_by=vote_average.desc&vote_count.gte=' + (isKids ? '30' : '150')
+      : 'sort_by=vote_average.desc&vote_count.gte=' + (isKids ? '15' : '80');
+  } else if (sort === 'new') {
+    sortQuery = mediaType === 'movie'
+      ? 'sort_by=primary_release_date.desc&vote_count.gte=5'
+      : 'sort_by=first_air_date.desc&vote_count.gte=3';
+  }
+
+  let withGenres = '';
+  let withoutGenres = '';
+
+  if (isKids) {
+    if (mediaType === 'movie') {
+      const gId = TMDB_MOVIE_GENRE_MAP[genreLower];
+      withGenres = gId ? `${gId},16|10751` : '16|10751';
+      withoutGenres = '27,80,53,10752,18';
+    } else {
+      const gId = TMDB_TV_GENRE_MAP[genreLower];
+      withGenres = gId ? `${gId},10762|10751|16` : '10762|10751|16';
+      withoutGenres = '80,27,10768,18';
+    }
+  } else {
+    if (mediaType === 'movie') {
+      const gId = TMDB_MOVIE_GENRE_MAP[genreLower];
+      if (gId) withGenres = gId;
+    } else {
+      const gId = TMDB_TV_GENRE_MAP[genreLower];
+      if (gId) withGenres = gId;
+    }
+  }
+
+  let path = `/discover/${tmdbType}?language=pt-BR&page=${page}&${sortQuery}&include_adult=false`;
+  if (withGenres) path += `&with_genres=${encodeURIComponent(withGenres)}`;
+  if (withoutGenres) path += `&without_genres=${encodeURIComponent(withoutGenres)}`;
+  if (isKids && mediaType === 'movie') {
+    path += '&certification_country=BR&certification.lte=10';
+  }
+
+  const tmdbRes = await fetchTmdbJson<{
+    page?: number;
+    total_pages?: number;
+    total_results?: number;
+    results?: Array<Record<string, unknown>>;
+  }>(path, 3500);
+
+  const rawResults = tmdbRes?.results ?? [];
+  const items: MediaTitle[] = [];
+
+  for (const r of rawResults) {
+    if (!r.poster_path || !r.backdrop_path) continue;
+    const mapped = mapTmdbSummaryToMediaTitle(r, mediaType);
+    if (isKids) {
+      mapped.ageRating = 'L';
+    }
+    items.push(mapped);
+  }
+
+  const totalPages = Math.min(tmdbRes?.total_pages || 1, 100);
+  const hasMore = page < totalPages && items.length > 0;
+
+  return {
+    items,
+    page,
+    totalPages,
+    hasMore,
+  };
+}
+
 async function fetchLiveCatalogFeed(): Promise<MediaTitle[]> {
   const hit = catalogCache.get('tmdb:combined');
   if (hit && hit.expiresAt > Date.now()) return hit.value;
 
-  const [trendDayRes, trendMoviesRes, trendTvRes, nowPlayingRes] = await Promise.all([
+  const [
+    trendDayRes,
+    trendMoviesRes,
+    trendTvRes,
+    nowPlayingRes,
+    popMoviesRes,
+    popTvRes,
+    topMoviesRes,
+    actionMoviesRes,
+  ] = await Promise.all([
     fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/trending/all/day?language=pt-BR', 3200),
     fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/trending/movie/week?language=pt-BR', 3200),
     fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/trending/tv/week?language=pt-BR', 3200),
     fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/movie/now_playing?language=pt-BR&region=BR', 3200),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/movie/popular?language=pt-BR&page=1', 3200),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/tv/popular?language=pt-BR&page=1', 3200),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/movie/top_rated?language=pt-BR&page=1', 3200),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>('/discover/movie?language=pt-BR&with_genres=28,878&sort_by=popularity.desc', 3200),
   ]);
 
   const combined: MediaTitle[] = [];
@@ -2384,6 +2565,10 @@ async function fetchLiveCatalogFeed(): Promise<MediaTitle[]> {
   addBatch(trendMoviesRes?.results, 'movie', true);
   addBatch(trendTvRes?.results, 'series', true);
   addBatch(nowPlayingRes?.results, 'movie', false);
+  addBatch(popMoviesRes?.results, 'movie', false);
+  addBatch(popTvRes?.results, 'series', false);
+  addBatch(topMoviesRes?.results, 'movie', false);
+  addBatch(actionMoviesRes?.results, 'movie', false);
 
   // Append any remaining curated favorites not already in the live feed
   for (const c of CURATED_CATALOG) {
@@ -2405,13 +2590,93 @@ async function fetchLiveCatalogFeed(): Promise<MediaTitle[]> {
     })
   );
 
-  const finalFeed = combined.slice(0, 60);
+  const finalFeed = combined.slice(0, 150);
   if (trendDayRes?.results?.length || trendMoviesRes?.results?.length) {
     catalogCache.set('tmdb:combined', {
       expiresAt: Date.now() + META_CACHE_TTL_MS,
       value: finalFeed,
     });
   }
+  return finalFeed;
+}
+
+async function fetchLiveKidsCatalogFeed(): Promise<MediaTitle[]> {
+  const hit = catalogCache.get('tmdb:kids');
+  if (hit && hit.expiresAt > Date.now()) return hit.value;
+
+  const [trendKidsRes, animMoviesRes, kidsTvRes, familyMoviesRes] = await Promise.all([
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>(
+      '/discover/movie?language=pt-BR&with_genres=16,10751&without_genres=27,80,53,10752&sort_by=popularity.desc',
+      3200
+    ),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>(
+      '/discover/movie?language=pt-BR&with_genres=16&without_genres=27,80,53,10752&sort_by=popularity.desc',
+      3200
+    ),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>(
+      '/discover/tv?language=pt-BR&with_genres=10762,10751,16&without_genres=80,27,10768&sort_by=popularity.desc',
+      3200
+    ),
+    fetchTmdbJson<{ results?: Array<Record<string, unknown>> }>(
+      '/discover/movie?language=pt-BR&with_genres=10751,12&without_genres=27,80,53,10752&sort_by=popularity.desc',
+      3200
+    ),
+  ]);
+
+  const combined: MediaTitle[] = [];
+  const seenKey = new Set<string>();
+
+  const addBatch = (
+    rows: Array<Record<string, unknown>> | undefined,
+    forceType?: 'movie' | 'series',
+    assignTop10Rank = false
+  ) => {
+    for (const r of rows ?? []) {
+      const mType = r.media_type;
+      if (!forceType && mType && mType !== 'movie' && mType !== 'tv') continue;
+      if (!r.poster_path || !r.backdrop_path) continue;
+      const mapped = mapTmdbSummaryToMediaTitle(r, forceType);
+      const k = `${mapped.mediaType}:${mapped.tmdbId}`;
+      if (!mapped.tmdbId || seenKey.has(k)) continue;
+      seenKey.add(k);
+      const entry: MediaTitle = { ...mapped, ageRating: 'L', rankToday: undefined };
+      if (assignTop10Rank && combined.length < 10) {
+        entry.rankToday = combined.length + 1;
+      }
+      combined.push(entry);
+    }
+  };
+
+  addBatch(trendKidsRes?.results, 'movie', true);
+  addBatch(animMoviesRes?.results, 'movie', true);
+  addBatch(kidsTvRes?.results, 'series', true);
+  addBatch(familyMoviesRes?.results, 'movie', false);
+
+  for (const c of CURATED_CATALOG) {
+    if (allowedForProfile(c, '10', true)) {
+      const k = `${c.mediaType}:${c.tmdbId}`;
+      if (!seenKey.has(k)) {
+        seenKey.add(k);
+        combined.push({ ...c, ageRating: 'L', rankToday: undefined });
+      }
+    }
+  }
+
+  const heroSlice = combined.slice(0, 7);
+  await Promise.allSettled(
+    heroSlice.map(async (item) => {
+      if (!item.logo && item.tmdbId) {
+        const logoUrl = await fetchTmdbHeroLogo(item.mediaType, item.tmdbId);
+        if (logoUrl) item.logo = logoUrl;
+      }
+    })
+  );
+
+  const finalFeed = combined.slice(0, 150);
+  catalogCache.set('tmdb:kids', {
+    expiresAt: Date.now() + META_CACHE_TTL_MS,
+    value: finalFeed,
+  });
   return finalFeed;
 }
 
@@ -2522,6 +2787,22 @@ async function fetchExactSkipSegments(opts: {
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api/pb', createPocketBaseRouter());
+  app.use('/api/analytics', createAnalyticsRouter());
+  const vipRouter = createVipRouter();
+  app.use('/api/vip', vipRouter);
+  app.post('/api/vip/visit', (req, res) => {
+    const ok = recordVisit(req.body || {});
+    res.set('Cache-Control', 'no-store').status(ok ? 200 : 400).json({ ok });
+  });
+  app.get('/api/urgent-announcement', (req, res, next) => {
+    req.url = '/urgent-announcement';
+    vipRouter(req, res, next);
+  });
+  app.post('/api/urgent-announcement', (req, res, next) => {
+    req.url = '/urgent-announcement';
+    vipRouter(req, res, next);
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'Kairou Media Engine' });
@@ -2547,13 +2828,88 @@ async function startServer() {
     res.json({ segments });
   });
 
-  app.get('/api/catalog', async (_req, res) => {
+  app.get('/api/catalog/browse', async (req, res) => {
     try {
-      const items = await fetchLiveCatalogFeed();
+      const mediaType = req.query.type === 'series' || req.query.type === 'tv' ? 'series' : 'movie';
+      const isKids = req.query.kids === 'true';
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const genre = typeof req.query.genre === 'string' ? req.query.genre.trim() : '';
+      const sort = typeof req.query.sort === 'string' ? req.query.sort.trim() : 'popular';
+
+      const result = await fetchPaginatedCatalog({ mediaType, isKids, page, genre, sort });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  app.get('/api/catalog', async (req, res) => {
+    try {
+      const isKids = req.query.kids === 'true';
+      const items = isKids ? await fetchLiveKidsCatalogFeed() : await fetchLiveCatalogFeed();
       res.json({ items });
     } catch {
       res.json({ items: CURATED_CATALOG });
     }
+  });
+
+  // Live TV Channels API (Canais Ao Vivo PT-BR / TVPlay / NTC TV)
+  app.get('/api/channels', (req, res) => {
+    try {
+      const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
+      const query = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+      let items = [...LIVE_CHANNELS];
+      if (category && category !== 'todos') {
+        items = items.filter((c) => c.category === category);
+      }
+      if (query) {
+        items = items.filter(
+          (c) =>
+            c.name.toLowerCase().includes(query) ||
+            c.slug.toLowerCase().includes(query) ||
+            c.categoryLabel.toLowerCase().includes(query)
+        );
+      }
+      res.json({
+        channels: items,
+        categories: CHANNEL_CATEGORIES,
+        total: items.length,
+      });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  app.get('/api/channels/:id', (req, res) => {
+    const id = req.params.id;
+    const channel = LIVE_CHANNELS.find((c) => c.id === id || c.slug === id);
+    if (!channel) {
+      res.status(404).json({ error: 'Canal não encontrado' });
+      return;
+    }
+    res.json({ channel });
+  });
+
+  app.get('/api/channels/stream/:id', (req, res) => {
+    const id = req.params.id;
+    const channel = LIVE_CHANNELS.find((c) => c.id === id || c.slug === id);
+    if (!channel) {
+      res.status(404).json({ error: 'Canal não encontrado' });
+      return;
+    }
+    res.json({
+      ok: true,
+      id: channel.id,
+      name: channel.name,
+      logo: channel.logo,
+      streamUrl: channel.streamUrl,
+      backupStreamUrl: channel.backupStreamUrl,
+      category: channel.category,
+      categoryLabel: channel.categoryLabel,
+      quality: channel.quality,
+      format: 'hls',
+      isLive: true,
+    });
   });
 
   app.get('/api/search', async (req, res) => {
@@ -2596,7 +2952,21 @@ async function startServer() {
     );
 
     const tmdbMatch = rawId.match(/^tmdb-(?:movie|series)-(\d+)$/)?.[1];
-    const tmdbId = curated?.tmdbId || tmdbMatch || (/^\d+$/.test(rawId) ? rawId : '');
+    let tmdbId = curated?.tmdbId || tmdbMatch || (/^\d+$/.test(rawId) ? rawId : '');
+
+    if (!tmdbId && /^tt\d+/i.test(rawId)) {
+      try {
+        const findRes = await fetchTmdbJson<{
+          movie_results?: Array<{ id: number }>;
+          tv_results?: Array<{ id: number }>;
+        }>(`/find/${rawId}?external_source=imdb_id`, 3000);
+        if (findRes?.movie_results && findRes.movie_results.length > 0) {
+          tmdbId = String(findRes.movie_results[0].id);
+        } else if (findRes?.tv_results && findRes.tv_results.length > 0) {
+          tmdbId = String(findRes.tv_results[0].id);
+        }
+      } catch {}
+    }
 
     if (tmdbId) {
       const rich = await fetchTmdbDetailTitle(type, tmdbId);
@@ -2687,18 +3057,6 @@ async function startServer() {
         ? `movie:${parsed.tmdbId}`
         : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
 
-    if (!refresh) {
-      const hit = extractCache.get(cacheKey);
-      if (hit && hit.expiresAt > Date.now()) {
-        res.json({
-          jobId: null,
-          done: true,
-          snapshot: { ...hit.value, cached: true, elapsedMs: Date.now() - startedAt },
-        });
-        return;
-      }
-    }
-
     const extractTarget: ExtractTarget = {
       ...parsed,
       imdbId: hintImdb,
@@ -2770,6 +3128,7 @@ async function startServer() {
         job.resolvedTitle
       );
       if (job.lastSnapshot.streams.length > 0) {
+        void setSharedCache(cacheKey, { streams: job.rawStreams, subtitles: job.rawSubs, resolvedTitle: job.resolvedTitle });
         extractCache.set(cacheKey, {
           expiresAt: Date.now() + EXTRACT_CACHE_TTL_MS,
           value: job.lastSnapshot,
@@ -2782,10 +3141,10 @@ async function startServer() {
       setTimeout(() => activeJobs.delete(jobId), 45_000);
     });
 
-    // Race up to 1250ms so Wave 1 verified H.264 1080p stream returns directly in the initial POST response
+    // Race up to 2400ms (or earlier as soon as verified stream arrives) so initial response returns real streams
     await Promise.race([
       firstWaveReady,
-      new Promise<void>((resolve) => setTimeout(resolve, 1250)),
+      new Promise<void>((resolve) => setTimeout(resolve, 2400)),
     ]);
 
     res.json({
@@ -2812,7 +3171,11 @@ async function startServer() {
       if (res.writableEnded) return;
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
       if (payload.done) {
-        res.end();
+        setTimeout(() => {
+          if (!res.writableEnded) {
+            try { res.end(); } catch {}
+          }
+        }, 1200);
       }
     };
 
@@ -2899,6 +3262,18 @@ async function startServer() {
       }
     }
 
+    if (!refresh) {
+      const shared = await getSharedCache<{ streams: InternalExtractedStream[]; subtitles: InternalSubtitle[]; resolvedTitle?: string }>(cacheKey);
+      if (shared && Array.isArray(shared.streams) && Array.isArray(shared.subtitles)) {
+        const verified = await verifyStreamsBatch(shared.streams);
+        if (verified.length) {
+          const snapshot = buildAnonymizedSnapshot(verified, shared.subtitles, tStart, true, shared.resolvedTitle);
+          res.json(snapshot);
+          return;
+        }
+      }
+    }
+
     const extractTarget: ExtractTarget = {
       ...parsed,
       imdbId: hintImdb,
@@ -2930,6 +3305,7 @@ async function startServer() {
     );
 
     if (responsePayload.streams.length > 0) {
+      void setSharedCache(cacheKey, { streams: rawStreams, subtitles: rawSubs, resolvedTitle });
       extractCache.set(cacheKey, {
         expiresAt: Date.now() + EXTRACT_CACHE_TTL_MS,
         value: responsePayload,
@@ -3136,22 +3512,60 @@ async function startServer() {
     }
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+  // Server-rendered metadata and XML sitemaps from the original REA SEO engine.
+  const seo = await import('./server/seoEngine.js');
+  const maps: Record<string, () => Promise<string>> = {
+    '/sitemap.xml': seo.getSitemapIndex,
+    '/sitemap-static.xml': seo.getStaticSitemap,
+    '/sitemap-movies.xml': seo.getMoviesSitemap,
+    '/sitemap-series.xml': seo.getSeriesSitemap,
+    '/sitemap-animes.xml': seo.getAnimesSitemap,
+  };
+  for (const [route, generate] of Object.entries(maps)) {
+    app.get(route, async (_req, res, next) => {
+      try { res.type('application/xml').set('Cache-Control', 'public, max-age=3600').send(await generate()); }
+      catch (error) { next(error); }
     });
   }
+  app.get(/^\/(filme|serie|anime|movie|tv)\/([a-zA-Z0-9_:-]+?)(?:-([^/?#]+))?\/?$/i, async (req, res, next) => {
+    try { await seo.renderSeoPage(req, res, { type: req.params[0], id: req.params[1], slug: req.params[2] }); }
+    catch (error) { next(error); }
+  });
+  app.get(/^\/(filmes|series|animes|canais|minha-lista)\/?$/i, async (req, res, next) => {
+    try {
+      const section = req.params[0];
+      seo.renderSectionSeo(req, res, section);
+    } catch (error) { next(error); }
+  });
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Kairou server running on http://0.0.0.0:${PORT}`);
+  const distPath = path.join(__dirname, 'dist');
+  const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, 'index.html'));
+
+  if (process.env.NODE_ENV === 'production' || hasDist) {
+    app.use(express.static(distPath));
+    app.use((req, res, next) => {
+      if (req.originalUrl.startsWith('/api/')) return next();
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } catch {
+      app.use(express.static(distPath));
+      app.use((req, res, next) => {
+        if (req.originalUrl.startsWith('/api/')) return next();
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
+  }
+
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`Kairou server running on http://127.0.0.1:${PORT}`);
   });
 }
 

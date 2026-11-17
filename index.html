@@ -2,29 +2,142 @@
 <html lang="pt-BR" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Kairou — Streaming em 4K &amp; PT-BR</title>
-    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <meta
-      name="description"
-      content="Kairou: plataforma de streaming cinematográfico em 4K UHD e PT-BR com reprodução instantânea, legendas personalizáveis e catálogo completo."
-    />
-    <meta property="og:title" content="Kairou — Streaming em 4K &amp; PT-BR" />
-    <meta
-      property="og:description"
-      content="Kairou: plataforma de streaming cinematográfico em 4K UHD e PT-BR com reprodução instantânea e catálogo completo."
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>Kairou — Assistir Filmes, Séries e Animes Online Grátis em HD e 4K</title>
+    <meta name="title" content="Kairou — Assistir Filmes, Séries e Animes Online Grátis em HD e 4K" />
+    <meta name="description" content="Assista a filmes, séries completas e animes online gratuitamente em alta definição (HD e 4K). Catálogo atualizado diariamente com lançamentos dublados e legendados no Kairou." />
+    <meta name="keywords" content="assistir filmes online, filmes online gratis, assistir series online, series gratis, assistir animes online, animes dublados, animes legendados, filmes 4k gratis, kairou, kairou streaming, kairou space, filmes lançamentos, series em alta, cinema online, kairou anime" />
+    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    <meta name="googlebot" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    <link rel="canonical" href="https://www.kairou.space/" />
+
+    <!-- Open Graph / Facebook -->
     <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://www.kairou.space/" />
+    <meta property="og:site_name" content="Kairou Streaming" />
+    <meta property="og:title" content="Kairou — Assistir Filmes, Séries e Animes Online Grátis em HD e 4K" />
+    <meta property="og:description" content="Assista a filmes, séries completas e animes online gratuitamente em alta definição (HD e 4K). Catálogo atualizado diariamente com lançamentos dublados e legendados no Kairou." />
+    <meta property="og:image" content="https://www.kairou.space/assets/mark.svg" />
+    <meta property="og:locale" content="pt_BR" />
+
+    <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:url" content="https://www.kairou.space/" />
+    <meta name="twitter:title" content="Kairou — Assistir Filmes, Séries e Animes Online Grátis em HD e 4K" />
+    <meta name="twitter:description" content="Assista a filmes, séries completas e animes online gratuitamente em alta definição (HD e 4K). Catálogo atualizado diariamente no Kairou." />
+    <meta name="twitter:image" content="https://www.kairou.space/assets/mark.svg" />
+
+    <!-- Schema.org JSON-LD -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "WebSite",
+          "@id": "https://www.kairou.space/#website",
+          "url": "https://www.kairou.space/",
+          "name": "Kairou",
+          "alternateName": ["Kairou Streaming", "kairou.space", "Kairou Filmes e Séries"],
+          "description": "Plataforma de streaming online para assistir filmes, séries e animes gratuitamente em HD e 4K.",
+          "inLanguage": "pt-BR",
+          "potentialAction": {
+            "@type": "SearchAction",
+            "target": {
+              "@type": "EntryPoint",
+              "urlTemplate": "https://www.kairou.space/#/search?q={search_term_string}"
+            },
+            "query-input": "required name=search_term_string"
+          }
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.kairou.space/#organization",
+          "name": "Kairou Streaming",
+          "url": "https://www.kairou.space/",
+          "logo": "https://www.kairou.space/assets/mark.svg"
+        }
+      ]
+    }
+    </script>
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#050609" />
+    <link rel="icon" type="image/svg+xml" href="/assets/mark.svg" />
+    <link rel="shortcut icon" href="/assets/mark.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/assets/kairou-spiral.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
+    <link rel="stylesheet" href="/rea-admin/admin.css" />
+  <link rel="stylesheet" href="/rea-admin/fa/css/all.min.css" />
   </head>
   <body class="bg-[#08090C] text-white antialiased selection:bg-sky-400/25 selection:text-white overflow-x-clip">
     <div id="root"></div>
+<div class="admin" id="admin-panel" hidden>
+  <div class="admin__scrim" data-close-admin></div>
+  <div class="admin__shell" role="dialog" aria-modal="true" aria-labelledby="admin-title">
+    <header class="admin__top">
+      <div class="admin__brand">
+        <span class="admin__mark"><i class="fa-solid fa-shield-halved" aria-hidden="true"></i></span>
+        <div>
+          <p class="admin__eyebrow">Console do administrador</p>
+          <h2 class="admin__title" id="admin-title">Central Kairou</h2>
+        </div>
+      </div>
+      <div class="admin__top-actions">
+        <span class="admin__who"><span class="admin__dot"></span><span id="admin-who-email"></span></span>
+        <button class="admin__iconbtn" id="admin-refresh" title="Atualizar dados" aria-label="Atualizar dados"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i></button>
+        <button class="admin__iconbtn admin__iconbtn--close" data-close-admin title="Fechar" aria-label="Fechar painel"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+      </div>
+    </header>
+
+    <div class="admin__body" id="admin-body">
+      <div class="admin__loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i> Carregando dados…</div>
+    </div>
+  </div>
+</div>
+
+<!-- ░░ MODAL AVISO ANTI-ADBLOCK (Estilo Zunderflix / Kai2 / REA) ░░ -->
+<div class="adblock-modal" id="adblock-modal" hidden>
+  <div class="adblock-modal__backdrop" data-close-adblock></div>
+  <div class="adblock-modal__card" role="dialog" aria-modal="true" aria-labelledby="adblock-title">
+    <div class="adblock-modal__banner">
+      <div class="adblock-modal__stripes" aria-hidden="true"></div>
+      <button type="button" class="adblock-modal__close" data-close-adblock aria-label="Fechar"><i class="fa-solid fa-xmark"></i></button>
+      <div class="adblock-modal__badge">
+        <div class="adblock-modal__badge-inner">
+          <i class="fa-solid fa-hand"></i>
+        </div>
+      </div>
+    </div>
+    <div class="adblock-modal__body">
+      <h2 class="adblock-modal__title" id="adblock-title">Bloqueador de anúncios ativado</h2>
+      <p class="adblock-modal__text">
+        Os anúncios são o que mantêm o Kairou grátis. Desative o bloqueador para o <span class="adblock-modal__domain">kairou.space</span>, ou assine o VIP e assista sem nenhum anúncio.
+      </p>
+      <div class="adblock-modal__feedback" id="adblock-feedback" hidden></div>
+      <div class="adblock-modal__actions">
+        <button type="button" class="adblock-modal__btn adblock-modal__btn--vip" id="adblock-btn-vip">
+          <i class="fa-solid fa-crown"></i>
+          <span>Assinar o VIP sem anúncios</span>
+        </button>
+        <button type="button" class="adblock-modal__btn adblock-modal__btn--recheck" id="adblock-btn-recheck">
+          <i class="fa-solid fa-rotate" id="adblock-recheck-icon" style="display:none;"></i>
+          <span id="adblock-recheck-text">Já desativei</span>
+        </button>
+        <button type="button" class="adblock-modal__link" id="adblock-btn-continue">
+          Continuar mesmo assim
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+    <script src="/js/ads.js"></script>
+    <script src="/rea-admin/admin.js"></script>
+    <script>document.querySelectorAll("[data-close-admin]").forEach(el => el.addEventListener("click", () => window.KairouAdmin.close()));</script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

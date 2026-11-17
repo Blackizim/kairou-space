@@ -43,6 +43,9 @@ export interface MediaTitle {
   defaultEpisode?: number;
   seasonsCount?: number;
   episodes?: EpisodeItem[];
+  originalLanguage?: string;
+  country?: string;
+  isAnime?: boolean;
 }
 
 export interface StudioNetwork {

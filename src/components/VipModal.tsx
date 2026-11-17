@@ -1,15 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, CheckCircle2, Copy, Crown, ExternalLink, KeyRound, X, Zap } from 'lucide-react';
+import { CheckCircle2, Crown, ExternalLink, KeyRound, Loader2, X, Zap } from 'lucide-react';
+import { getPocketBaseToken, refreshPocketBase } from '../utils/pocketbase';
 import type { Account } from './AccountModal';
 import {
   VIP_PLANS,
-  computeExtendedVipUntil,
   formatVipExpiration,
   isAccountVip,
-  parseVipCode,
-  validatePixIdentifier,
   type VipPlanId,
 } from '../utils/vipHelpers';
+
+const PIXGG_URL = 'https://pixgg.com/pommern';
 
 interface VipModalProps {
   account: Account;
@@ -19,17 +19,16 @@ interface VipModalProps {
 
 export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, onClose }) => {
   const [selectedPlanId, setSelectedPlanId] = useState<VipPlanId>('trimestral');
-  const [pixStepOpen, setPixStepOpen] = useState(false);
-  const [copiedPix, setCopiedPix] = useState(false);
   const [pixIdentifier, setPixIdentifier] = useState('');
   const [vipCode, setVipCode] = useState('');
+  const [isChecking, setIsChecking] = useState(false);
+  const [isRedeeming, setIsRedeeming] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
   const pixInputRef = useRef<HTMLInputElement>(null);
 
   const vipActive = isAccountVip(account);
   const expirationLabel = formatVipExpiration(account.vipUntil);
   const selectedPlan = VIP_PLANS.find((p) => p.id === selectedPlanId) ?? VIP_PLANS[1];
-  const pixReference = `KAIROU-VIP-${selectedPlan.badge}-${account.email.split('@')[0].toUpperCase().slice(0, 8)}`;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -39,62 +38,89 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const handleOpenPix = () => {
-    setPixStepOpen(true);
+  const requestVip = async (action: string, body: object) => {
+    const token = getPocketBaseToken();
+    const response = await fetch(`/api/vip/${action}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: token } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.message || 'Não foi possível confirmar agora.');
+    }
+    const refreshed = await refreshPocketBase();
+    if (refreshed) {
+      onUpdateAccount(refreshed);
+    }
+    return data;
+  };
+
+  const handleConfirmPix = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const query = pixIdentifier.trim();
+    if (!query) {
+      setFeedback({ kind: 'error', text: 'Informe seu nome ou e-mail usado no PixGG.' });
+      return;
+    }
+    setIsChecking(true);
     setFeedback(null);
-    setTimeout(() => pixInputRef.current?.focus(), 60);
-  };
-
-  const handleCopyPixRef = async () => {
     try {
-      await navigator.clipboard.writeText(pixReference);
-      setCopiedPix(true);
-      setTimeout(() => setCopiedPix(false), 1800);
-    } catch {
-      // ignore clipboard errors
+      const result = await requestVip('check-payment', { query });
+      setFeedback({
+        kind: 'success',
+        text: result.message || 'Pagamento confirmado e VIP ativado!',
+      });
+      setPixIdentifier('');
+      if (result.userVipUntil) {
+        onUpdateAccount({
+          ...account,
+          vipUntil: new Date(result.userVipUntil).getTime(),
+        });
+      }
+    } catch (error) {
+      setFeedback({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Falha ao verificar pagamento.',
+      });
+    } finally {
+      setIsChecking(false);
     }
   };
 
-  const handleConfirmPix = (e: React.FormEvent) => {
+  const handleRedeemCode = async (e: React.FormEvent) => {
     e.preventDefault();
-    const check = validatePixIdentifier(pixIdentifier);
-    if (!check.valid) {
-      setFeedback({ kind: 'error', text: check.reason || 'Informe os dados do PixGG.' });
+    const code = vipCode.trim().toUpperCase();
+    if (!code) {
+      setFeedback({ kind: 'error', text: 'Informe um código VIP para resgatar.' });
       return;
     }
-
-    const nextVipUntil = computeExtendedVipUntil(account.vipUntil, selectedPlan.durationDays);
-    onUpdateAccount({
-      ...account,
-      vipUntil: nextVipUntil,
-    });
-    setPixIdentifier('');
-    setPixStepOpen(false);
-    setFeedback({
-      kind: 'success',
-      text: `Plano ${selectedPlan.label} ativado! VIP válido até ${formatVipExpiration(nextVipUntil)}.`,
-    });
-  };
-
-  const handleRedeemCode = (e: React.FormEvent) => {
-    e.preventDefault();
-    const parsed = parseVipCode(vipCode, account.redeemedVipCodes ?? []);
-    if (!parsed.valid) {
-      setFeedback({ kind: 'error', text: parsed.reason });
-      return;
+    setIsRedeeming(true);
+    setFeedback(null);
+    try {
+      const result = await requestVip('verify', { code });
+      setFeedback({
+        kind: 'success',
+        text: result.message || 'Código VIP resgatado e VIP atualizado com sucesso!',
+      });
+      setVipCode('');
+      if (result.userVipUntil) {
+        onUpdateAccount({
+          ...account,
+          vipUntil: new Date(result.userVipUntil).getTime(),
+        });
+      }
+    } catch (error) {
+      setFeedback({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Código inválido ou expirado.',
+      });
+    } finally {
+      setIsRedeeming(false);
     }
-
-    const nextVipUntil = computeExtendedVipUntil(account.vipUntil, parsed.durationDays);
-    onUpdateAccount({
-      ...account,
-      vipUntil: nextVipUntil,
-      redeemedVipCodes: [...(account.redeemedVipCodes ?? []), parsed.normalizedCode],
-    });
-    setVipCode('');
-    setFeedback({
-      kind: 'success',
-      text: `Código ${parsed.normalizedCode} resgatado! VIP válido até ${formatVipExpiration(nextVipUntil)}.`,
-    });
   };
 
   return (
@@ -128,13 +154,21 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
             4K UHD · Zero anúncios · Servidor VIP · 5 perfis
           </p>
 
-          {vipActive && (
+          {vipActive ? (
             <div className="mt-3.5 flex flex-wrap items-center gap-2.5">
               <span className="inline-flex items-center gap-1.5 rounded-full bg-[#fde047] px-3 py-1 text-xs font-extrabold text-slate-950 shadow-sm">
                 <Crown className="h-3.5 w-3.5 fill-slate-950 text-slate-950" />
                 VIP ativo
               </span>
               <span className="text-[13px] text-slate-400 tabular-nums">até {expirationLabel}</span>
+            </div>
+          ) : (
+            <div className="mt-3.5 flex flex-wrap items-center gap-2.5">
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.08] px-3 py-1 text-xs font-bold text-slate-300">
+                <Crown className="h-3.5 w-3.5 text-slate-400" />
+                Plano gratuito
+              </span>
+              <span className="text-[13px] text-slate-400">1080p · com anúncios</span>
             </div>
           )}
         </div>
@@ -173,58 +207,29 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
 
         {/* Checkout & Redemption Panel */}
         <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] p-4 space-y-4">
-          <button
-            type="button"
-            onClick={handleOpenPix}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#22d3ee] to-[#0ea5e9] px-4 py-3.5 text-sm font-bold text-white shadow-[0_12px_28px_-10px_rgba(14,165,233,0.75)] transition-all hover:brightness-110 active:scale-[0.99] cursor-pointer"
+          <a
+            id="vip-pay"
+            href={PIXGG_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#0ea5e9] px-4 py-3.5 text-sm font-bold text-white shadow-[0_12px_28px_-10px_rgba(14,165,233,0.75)] transition-all hover:brightness-110 active:scale-[0.99] cursor-pointer"
           >
             <Zap className="h-4 w-4 fill-current" />
             <span>
               Pagar {selectedPlan.label} ({selectedPlan.priceLabel}) no Pix
             </span>
-          </button>
-
-          {pixStepOpen && (
-            <div className="rounded-xl border border-sky-400/25 bg-sky-500/10 p-3 text-xs text-slate-200 space-y-2 animate-vaelor-enter">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-semibold text-sky-200">
-                  PixGG · Plano {selectedPlan.label} ({selectedPlan.priceLabel})
-                </span>
-                <a
-                  href="https://pixgg.com"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 font-semibold text-sky-300 underline hover:text-white"
-                >
-                  Abrir PixGG
-                  <ExternalLink className="h-3 w-3" />
-                </a>
-              </div>
-              <div className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-black/30 px-2.5 py-2">
-                <code className="truncate text-[11px] text-slate-200">{pixReference}</code>
-                <button
-                  type="button"
-                  onClick={handleCopyPixRef}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-md bg-white/10 px-2 py-1 text-[11px] font-semibold text-white hover:bg-white/20 cursor-pointer"
-                >
-                  {copiedPix ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-                  {copiedPix ? 'Copiado' : 'Copiar ref.'}
-                </button>
-              </div>
-              <p className="text-[11px] text-slate-300/90">
-                Após concluir no PixGG, informe o nome ou e-mail abaixo e clique em Confirmar para liberar seu VIP.
-              </p>
-            </div>
-          )}
+            <ExternalLink className="h-3.5 w-3.5 opacity-80" />
+          </a>
 
           <form onSubmit={handleConfirmPix} className="space-y-2">
-            <label className="flex items-center gap-1.5 text-xs font-bold text-slate-200">
+            <label className="flex items-center gap-1.5 text-xs font-bold text-slate-200" htmlFor="vip-query">
               <CheckCircle2 className="h-3.5 w-3.5 fill-sky-400 text-[#111824]" />
               <span>Já pagou? Confirme seu Pix:</span>
             </label>
             <div className="flex gap-2">
               <input
                 ref={pixInputRef}
+                id="vip-query"
                 type="text"
                 value={pixIdentifier}
                 onChange={(e) => setPixIdentifier(e.target.value)}
@@ -233,20 +238,23 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
               />
               <button
                 type="submit"
-                className="shrink-0 rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-white/12 cursor-pointer"
+                disabled={isChecking}
+                className="shrink-0 rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-white/12 disabled:opacity-50 cursor-pointer flex items-center gap-1.5"
               >
-                Confirmar
+                {isChecking && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                <span>{isChecking ? 'Buscando…' : 'Confirmar'}</span>
               </button>
             </div>
           </form>
 
           <form onSubmit={handleRedeemCode} className="space-y-2">
-            <label className="flex items-center gap-1.5 text-xs font-bold text-slate-200">
+            <label className="flex items-center gap-1.5 text-xs font-bold text-slate-200" htmlFor="vip-code-input">
               <KeyRound className="h-3.5 w-3.5 text-sky-400" />
               <span>Resgatar código VIP:</span>
             </label>
             <div className="flex gap-2">
               <input
+                id="vip-code-input"
                 type="text"
                 value={vipCode}
                 onChange={(e) => setVipCode(e.target.value)}
@@ -255,9 +263,11 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
               />
               <button
                 type="submit"
-                className="shrink-0 rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-white/12 cursor-pointer"
+                disabled={isRedeeming}
+                className="shrink-0 rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-white/12 disabled:opacity-50 cursor-pointer flex items-center gap-1.5"
               >
-                Resgatar
+                {isRedeeming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                <span>{isRedeeming ? 'Resgatando…' : 'Resgatar'}</span>
               </button>
             </div>
           </form>
@@ -279,7 +289,7 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
         <p className="mt-4 text-center text-[11.5px] text-slate-400">
           Pagamento instantâneo via{' '}
           <a
-            href="https://pixgg.com"
+            href={PIXGG_URL}
             target="_blank"
             rel="noopener noreferrer"
             className="font-semibold text-slate-200 underline hover:text-white"

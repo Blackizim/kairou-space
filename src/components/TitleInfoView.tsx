@@ -9,12 +9,10 @@ import {
   Play,
   Plus,
   RefreshCw,
-  Sparkles,
   Star,
 } from 'lucide-react';
 import type { EpisodeItem, MediaTitle } from '../data/curatedCatalog';
 import type { AnonymizedExtractResponse } from '../types/player';
-import { KairouLogo } from './KairouLogo';
 
 interface TitleInfoViewProps {
   item: MediaTitle;
@@ -155,12 +153,6 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
 
             <div className="space-y-2">
               <p className="text-sm font-medium text-stone-200">{item.genres.join(' · ')}</p>
-              {item.rankToday && (
-                <div className="inline-flex items-center gap-2 text-sm font-semibold text-white">
-                  <KairouLogo size="sm" className="-ml-0.5" />
-                  <span>#{item.rankToday} hoje no Kairou</span>
-                </div>
-              )}
             </div>
 
             {/* Action Buttons Row */}
@@ -215,8 +207,8 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
                 type="button"
                 onClick={onRefreshExtract}
                 disabled={extractState.status === 'loading'}
-                aria-label="Atualizar opções de reprodução"
-                title="Atualizar opções"
+                aria-label="Atualizar servidores de reprodução"
+                title="Atualizar servidores"
                 className="w-11 h-11 rounded-full bg-white/12 text-white border border-white/18 hover:bg-white/20 backdrop-blur-md flex items-center justify-center transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RefreshCw
@@ -250,24 +242,6 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
             <p className="text-sm sm:text-[15px] text-stone-200/90 leading-relaxed max-w-xl">
               {item.overview}
             </p>
-
-            {/* Clean native cinema feature badges (Lucide icons only, no OS emojis) */}
-            {(ptBrCount > 0 || uhdCount > 0) && (
-              <div className="flex flex-wrap items-center gap-4 pt-1 text-xs font-medium text-stone-300">
-                {ptBrCount > 0 && (
-                  <span className="inline-flex items-center gap-1.5 text-emerald-300">
-                    <Languages className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    Áudio em Português Disponível
-                  </span>
-                )}
-                {uhdCount > 0 && (
-                  <span className="inline-flex items-center gap-1.5 text-amber-300">
-                    <Sparkles className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    Qualidade 4K / Ultra FHD Opcional
-                  </span>
-                )}
-              </div>
-            )}
           </div>
 
           {/* Right Translucent Specs Box */}
@@ -293,23 +267,13 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
                 <span className="text-stone-400">Qualidade Máx.</span>
                 <span className="font-display font-medium tracking-wide text-white">{highestQuality}</span>
               </div>
-              <div className="flex items-center justify-between px-4 py-3">
-                <span className="text-stone-400">Opções</span>
-                <span className="font-medium text-emerald-300 tabular-nums">
-                  {streams.length > 0
-                    ? `${streams.length} ${streams.length === 1 ? 'disponível' : 'disponíveis'}`
-                    : extractState.status === 'loading'
-                      ? 'Sincronizando...'
-                      : 'Indisponível'}
-                </span>
-              </div>
             </div>
 
             {/* Quick Playback Options */}
             {streams.length > 0 && (
               <div className="rounded-2xl bg-white/[0.04] border border-white/10 p-3 space-y-2">
                 <p className="text-[11px] font-display font-semibold uppercase tracking-wider text-stone-400 px-1">
-                  Opções de Reprodução Imediata
+                  Reprodução Imediata
                 </p>
                 <div className="space-y-1.5 max-h-40 overflow-y-auto no-scrollbar">
                   {streams.slice(0, 4).map((st, idx) => (
@@ -417,7 +381,7 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
             </div>
 
             {/* Horizontal Widescreen Episode Cards Strip matching uploaded reference */}
-            <div className="flex gap-4 overflow-x-auto pb-4 vaelor-episodes-scroll">
+            <div className="flex gap-4 overflow-x-auto overflow-y-hidden pt-2 pb-4 vaelor-episodes-scroll">
               {seasonEpisodes.map((ep) => {
                 const isSelected =
                   ep.season === selectedSeason && ep.episode === selectedEpisode;

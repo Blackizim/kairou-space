@@ -1,163 +1,398 @@
-import React, { useMemo, useState } from 'react';
-import { BookmarkX, Film, Play, Star, Tv } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Check, ChevronDown, Play, Plus, Star } from 'lucide-react';
 import type { MediaTitle } from '../data/curatedCatalog';
-import { useScrollReveal } from '../utils/useScrollReveal';
-import { filterCatalogTitles } from '../utils/streamLogic';
 
 interface CatalogGridViewProps {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   items: MediaTitle[];
   mediaTypeFilter: 'all' | 'movie' | 'series';
+  myListIds?: string[];
+  onToggleMyList?: (item: MediaTitle) => void;
   emptyMessage?: string;
   onOpenInfo: (item: MediaTitle) => void;
+  isKids?: boolean;
 }
+
+type SortKind = 'popular' | 'rating' | 'new';
+
+const MOVIE_GENRES = [
+  { id: '', label: 'Todos os gêneros' },
+  { id: 'Ação', label: 'Ação' },
+  { id: 'Aventura', label: 'Aventura' },
+  { id: 'Comédia', label: 'Comédia' },
+  { id: 'Terror', label: 'Terror' },
+  { id: 'Ficção Científica', label: 'Ficção Científica' },
+  { id: 'Drama', label: 'Drama' },
+  { id: 'Animação', label: 'Animação' },
+  { id: 'Romance', label: 'Romance' },
+  { id: 'Suspense', label: 'Suspense' },
+  { id: 'Crime', label: 'Crime' },
+  { id: 'Fantasia', label: 'Fantasia' },
+];
+
+const SERIES_GENRES = [
+  { id: '', label: 'Todos os gêneros' },
+  { id: 'Drama', label: 'Drama' },
+  { id: 'Ação', label: 'Ação & Aventura' },
+  { id: 'Comédia', label: 'Comédia' },
+  { id: 'Ficção Científica', label: 'Sci-Fi & Fantasia' },
+  { id: 'Suspense', label: 'Mistério' },
+  { id: 'Crime', label: 'Crime' },
+  { id: 'Animação', label: 'Animação' },
+  { id: 'Documentário', label: 'Documentário' },
+];
+
+const KIDS_MOVIE_GENRES = [
+  { id: '', label: 'Todos os gêneros' },
+  { id: 'Animação', label: 'Animação' },
+  { id: 'Aventura', label: 'Aventura' },
+  { id: 'Comédia', label: 'Comédia' },
+  { id: 'Família', label: 'Família' },
+  { id: 'Fantasia', label: 'Fantasia' },
+];
+
+const KIDS_SERIES_GENRES = [
+  { id: '', label: 'Todos os gêneros' },
+  { id: 'Animação', label: 'Desenhos Animados' },
+  { id: 'Aventura', label: 'Aventura & Família' },
+  { id: 'Comédia', label: 'Comédia' },
+  { id: 'Kids', label: 'Infantil' },
+  { id: 'Fantasia', label: 'Fantasia' },
+];
+
+const ALL_GENRES = [
+  { id: '', label: 'Todos os gêneros' },
+  { id: 'Ação', label: 'Ação' },
+  { id: 'Comédia', label: 'Comédia' },
+  { id: 'Drama', label: 'Drama' },
+  { id: 'Ficção Científica', label: 'Sci-Fi' },
+  { id: 'Animação', label: 'Animação' },
+];
+
+const PAGE_SIZE = 24;
 
 export const CatalogGridView: React.FC<CatalogGridViewProps> = ({
   title,
-  subtitle,
   items,
   mediaTypeFilter,
-  emptyMessage = 'Nenhum título disponível nesta seleção.',
+  myListIds = [],
+  onToggleMyList,
+  emptyMessage = 'Nenhum título encontrado para este gênero.',
   onOpenInfo,
+  isKids = false,
 }) => {
-  const [selectedGenre, setSelectedGenre] = useState<string | null>(null);
+  const [sort, setSort] = useState<SortKind>('popular');
+  const [selectedGenre, setSelectedGenre] = useState<string>('');
+  const [page, setPage] = useState<number>(1);
+  const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [failedImg, setFailedImg] = useState<Record<string, boolean>>({});
 
-  const genres = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const item of items) {
-      if (mediaTypeFilter !== 'all' && item.mediaType !== mediaTypeFilter) continue;
-      for (const g of item.genres) {
-        counts.set(g, (counts.get(g) ?? 0) + 1);
-      }
+  const isServerPaged = mediaTypeFilter === 'movie' || mediaTypeFilter === 'series';
+  const [serverItems, setServerItems] = useState<MediaTitle[]>([]);
+  const [serverPage, setServerPage] = useState<number>(1);
+  const [serverHasMore, setServerHasMore] = useState<boolean>(true);
+
+  const genreList = useMemo(() => {
+    if (isKids) {
+      if (mediaTypeFilter === 'movie') return KIDS_MOVIE_GENRES;
+      if (mediaTypeFilter === 'series') return KIDS_SERIES_GENRES;
     }
-    return [...counts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .map(([g]) => g);
-  }, [items, mediaTypeFilter]);
+    if (mediaTypeFilter === 'movie') return MOVIE_GENRES;
+    if (mediaTypeFilter === 'series') return SERIES_GENRES;
+    return ALL_GENRES;
+  }, [mediaTypeFilter, isKids]);
 
-  const filtered = useMemo(
-    () =>
-      filterCatalogTitles(items, {
-        mediaType: mediaTypeFilter,
-        genre: selectedGenre,
-      }),
-    [items, mediaTypeFilter, selectedGenre]
-  );
+  const filteredAndSorted = useMemo(() => {
+    // 1. Filter by mediaType
+    let result = items.filter((item) => {
+      if (mediaTypeFilter === 'all') return true;
+      return item.mediaType === mediaTypeFilter;
+    });
 
-  const revealRef = useScrollReveal<HTMLElement>([filtered]);
+    // 2. Filter by genre
+    if (selectedGenre) {
+      const q = selectedGenre.toLowerCase();
+      result = result.filter((item) =>
+        item.genres.some((g) => {
+          const gl = g.toLowerCase();
+          return gl.includes(q) || q.includes(gl);
+        })
+      );
+    }
+
+    // 3. Sort
+    if (sort === 'rating') {
+      result = [...result].sort((a, b) => Number(b.rating || 0) - Number(a.rating || 0));
+    } else if (sort === 'new') {
+      result = [...result].sort((a, b) => Number(b.year || 0) - Number(a.year || 0));
+    }
+
+    return result;
+  }, [items, mediaTypeFilter, selectedGenre, sort]);
+
+  // Initial and on-filter change fetch for server-paged catalogs
+  useEffect(() => {
+    if (!isServerPaged) return;
+    let cancelled = false;
+    setServerPage(1);
+    setServerHasMore(true);
+
+    const url = `/api/catalog/browse?type=${mediaTypeFilter}&kids=${Boolean(isKids)}&page=1&genre=${encodeURIComponent(
+      selectedGenre
+    )}&sort=${sort}`;
+
+    fetch(url)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { items?: MediaTitle[]; hasMore?: boolean } | null) => {
+        if (cancelled) return;
+        if (data?.items && data.items.length > 0) {
+          setServerItems(data.items);
+          setServerHasMore(Boolean(data.hasMore));
+        } else {
+          // Fallback to locally filtered items
+          setServerItems(filteredAndSorted);
+          setServerHasMore(false);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setServerItems(filteredAndSorted);
+        setServerHasMore(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaTypeFilter, isKids, selectedGenre, sort, isServerPaged, filteredAndSorted]);
+
+  const displayedItems = useMemo(() => {
+    if (isServerPaged) {
+      if (serverItems.length > 0) return serverItems;
+      return filteredAndSorted;
+    }
+    return filteredAndSorted.slice(0, page * PAGE_SIZE);
+  }, [isServerPaged, serverItems, filteredAndSorted, page]);
+
+  const hasMore = isServerPaged
+    ? serverHasMore
+    : displayedItems.length < filteredAndSorted.length;
+
+  const handleLoadMore = () => {
+    if (loadingMore) return;
+
+    if (!isServerPaged) {
+      setLoadingMore(true);
+      setTimeout(() => {
+        setPage((prev) => prev + 1);
+        setLoadingMore(false);
+      }, 280);
+      return;
+    }
+
+    setLoadingMore(true);
+    const nextPage = serverPage + 1;
+    const url = `/api/catalog/browse?type=${mediaTypeFilter}&kids=${Boolean(isKids)}&page=${nextPage}&genre=${encodeURIComponent(
+      selectedGenre
+    )}&sort=${sort}`;
+
+    fetch(url)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { items?: MediaTitle[]; hasMore?: boolean } | null) => {
+        if (data?.items && data.items.length > 0) {
+          setServerItems((prev) => {
+            const seen = new Set(prev.map((it) => it.id));
+            const fresh = data.items!.filter((it) => !seen.has(it.id));
+            return [...prev, ...fresh];
+          });
+          setServerPage(nextPage);
+          setServerHasMore(Boolean(data.hasMore));
+        } else {
+          setServerHasMore(false);
+        }
+      })
+      .catch(() => {
+        setServerHasMore(false);
+      })
+      .finally(() => {
+        setLoadingMore(false);
+      });
+  };
+
+  const panelName =
+    mediaTypeFilter === 'movie'
+      ? 'movies'
+      : mediaTypeFilter === 'series'
+        ? 'series'
+        : 'list';
 
   return (
-    <main ref={revealRef} className="mx-auto max-w-[1440px] px-5 sm:px-10 pt-28 pb-20 space-y-8 animate-vaelor-enter">
-      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 border-b border-white/10 pb-6">
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-2 text-xs font-display font-medium uppercase tracking-wider text-stone-400">
-            {mediaTypeFilter === 'movie' ? (
-              <Film className="w-3.5 h-3.5" />
-            ) : mediaTypeFilter === 'series' ? (
-              <Tv className="w-3.5 h-3.5" />
-            ) : null}
-            <span>{filtered.length} títulos disponíveis</span>
-          </div>
-          <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-white">
-            {title}
-          </h1>
-          <p className="text-sm text-stone-400">{subtitle}</p>
+    <section className="view" data-panel={panelName} aria-label={title}>
+      {/* ░░ Page Head (Exact REA layout) ░░ */}
+      <div className="page-head">
+        <div>
+          <p className="eyebrow">Catálogo</p>
+          <h2 className="page-title">{title}</h2>
         </div>
-
-        {/* Genre Filters */}
-        {genres.length > 0 && (
-          <div className="flex items-center gap-2 overflow-x-auto pb-1 no-scrollbar max-w-full">
-            <button
-              type="button"
-              onClick={() => setSelectedGenre(null)}
-              className={`px-3.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                selectedGenre === null
-                  ? 'bg-white text-stone-950 font-semibold'
-                  : 'bg-white/8 text-stone-300 hover:bg-white/15 hover:text-white'
-              }`}
-            >
-              Todos
-            </button>
-            {genres.map((genre) => {
-              const active = selectedGenre === genre;
-              return (
-                <button
-                  key={genre}
-                  type="button"
-                  onClick={() => setSelectedGenre(active ? null : genre)}
-                  className={`px-3.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                    active
-                      ? 'bg-white text-stone-950 font-semibold'
-                      : 'bg-white/8 text-stone-300 hover:bg-white/15 hover:text-white'
-                  }`}
-                >
-                  {genre}
-                </button>
-              );
-            })}
-          </div>
-        )}
+        <div className="segmented" data-seg={panelName}>
+          <button
+            type="button"
+            className={sort === 'popular' ? 'is-active' : ''}
+            onClick={() => {
+              setSort('popular');
+              setPage(1);
+            }}
+          >
+            Populares
+          </button>
+          <button
+            type="button"
+            className={sort === 'rating' ? 'is-active' : ''}
+            onClick={() => {
+              setSort('rating');
+              setPage(1);
+            }}
+          >
+            Melhor nota
+          </button>
+          <button
+            type="button"
+            className={sort === 'new' ? 'is-active' : ''}
+            onClick={() => {
+              setSort('new');
+              setPage(1);
+            }}
+          >
+            Lançamentos
+          </button>
+        </div>
       </div>
 
-      {filtered.length === 0 ? (
-        <div className="py-20 text-center space-y-3 border border-white/10 rounded-2xl bg-white/[0.02]">
-          <BookmarkX className="w-10 h-10 text-stone-500 mx-auto" />
-          <p className="text-sm text-stone-400">{emptyMessage}</p>
-        </div>
-      ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-5">
-          {filtered.map((item) => {
-            const posterSrc = failedImg[item.id]
-              ? '/src/assets/images/poster_nyc_winter_1794566231280.jpg'
-              : item.poster;
-
+      {/* ░░ Genre Chips (Exact REA layout) ░░ */}
+      <div className="genre-chips-wrap">
+        <div className="genre-chips" role="toolbar" aria-label={`Gêneros de ${title.toLowerCase()}`}>
+          {genreList.map((g) => {
+            const active = selectedGenre === g.id;
             return (
               <button
-                key={item.id}
-                data-scroll-reveal
+                key={g.id || 'all'}
                 type="button"
-                onClick={() => onOpenInfo(item)}
-                className="group text-left space-y-2.5 cursor-pointer focus-visible:outline-2 focus-visible:outline-white rounded-xl"
+                className={`genre-chip ${active ? 'is-active' : ''}`}
+                onClick={() => {
+                  setSelectedGenre(g.id);
+                  setPage(1);
+                }}
               >
-                <div className="relative aspect-[2/3] rounded-xl overflow-hidden bg-stone-900 border border-white/10 transition-transform duration-200 group-hover:-translate-y-1">
-                  <img
-                    src={posterSrc}
-                    alt={item.title}
-                    referrerPolicy="no-referrer"
-                    onError={() => setFailedImg((p) => ({ ...p, [item.id]: true }))}
-                    className="w-full h-full object-cover"
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/15 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex flex-col justify-between p-3">
-                    <span className="self-end text-[11px] font-display font-medium tracking-wide text-white bg-black/65 px-2 py-0.5 rounded-md">
-                      {item.qualityBadge}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <span className="w-9 h-9 rounded-full bg-white text-stone-950 flex items-center justify-center shadow-lg">
-                        <Play className="w-4 h-4 fill-current ml-0.5" />
-                      </span>
-                      <span className="text-xs font-semibold text-white">Ver Detalhes</span>
-                    </div>
-                  </div>
-                </div>
-                <div>
-                  <h2 className="text-sm font-semibold text-stone-100 group-hover:text-white truncate">
-                    {item.title}
-                  </h2>
-                  <p className="inline-flex items-center gap-1 text-xs text-stone-400 tabular-nums">
-                    <span>{item.year}</span>
-                    <span>·</span>
-                    <Star className="w-3 h-3 fill-amber-400 text-amber-400" strokeWidth={1.75} />
-                    <span>{item.rating}</span>
-                  </p>
-                </div>
+                {g.label}
               </button>
             );
           })}
         </div>
+      </div>
+
+      {/* ░░ Grid / Cards (Exact REA layout) ░░ */}
+      {displayedItems.length === 0 ? (
+        <p className="empty">{emptyMessage}</p>
+      ) : (
+        <div className="grid" id={`grid-${panelName}`}>
+          {displayedItems.map((item) => {
+            const isSaved = myListIds.includes(item.id);
+            const poster = failedImg[item.id]
+              ? '/src/assets/images/poster_nyc_winter_1794566231280.jpg'
+              : item.poster;
+
+            return (
+              <article
+                key={item.id}
+                className="card has-poster reveal"
+                onClick={() => onOpenInfo(item)}
+              >
+                <img
+                  className="card__poster"
+                  src={poster}
+                  alt={item.title}
+                  loading="lazy"
+                  decoding="async"
+                  referrerPolicy="no-referrer"
+                  onError={() => setFailedImg((p) => ({ ...p, [item.id]: true }))}
+                />
+                <div className="card__shade" aria-hidden="true" />
+                <div className="card__label">
+                  <span className="card__title">{item.title}</span>
+                  <span className="card__sub">
+                    {item.year || ''}{item.year ? ' · ' : ''}{item.mediaType === 'movie' ? 'Filme' : 'Série'}
+                  </span>
+                </div>
+                <div className="card__hover">
+                  <div className="card__quick">
+                    {onToggleMyList && (
+                      <button
+                        type="button"
+                        className={`quick-btn ${isSaved ? 'is-added' : ''}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleMyList(item);
+                        }}
+                        aria-label={isSaved ? 'Remover da lista' : 'Adicionar à lista'}
+                        aria-pressed={isSaved}
+                      >
+                        {isSaved ? <Check size={13} strokeWidth={2.5} /> : <Plus size={14} strokeWidth={2.5} />}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="quick-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenInfo(item);
+                      }}
+                      aria-label={`Mais informações sobre ${item.title}`}
+                    >
+                      <ChevronDown size={14} strokeWidth={2.5} />
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="card__play"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onOpenInfo(item);
+                    }}
+                    aria-label={`Reproduzir ${item.title}`}
+                  >
+                    <Play size={16} fill="currentColor" className="ml-0.5" />
+                  </button>
+
+                  <div className="card__meta">
+                    <span className="score">
+                      <Star size={11} fill="currentColor" />
+                      {Number(item.rating || 0).toFixed(1)}
+                    </span>
+                    <span className="truncate">{item.genres?.[0] || (item.mediaType === 'movie' ? 'Filme' : 'Série')}</span>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
       )}
-    </main>
+
+      {/* ░░ Load More (Exact REA layout) ░░ */}
+      {hasMore && (
+        <div className="load-more-wrap">
+          <button
+            type="button"
+            className={`btn-load-more ${loadingMore ? 'is-loading' : ''}`}
+            onClick={handleLoadMore}
+          >
+            <span className="btn-load-more__text">
+              Carregar mais {mediaTypeFilter === 'movie' ? (isKids ? 'filmes infantis' : 'filmes') : (isKids ? 'desenhos e séries' : 'séries')}
+            </span>
+            <span className="btn-load-more__spinner" aria-hidden="true" />
+          </button>
+        </div>
+      )}
+    </section>
   );
 };

@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Crown, LogOut, Pencil, Plus, Users } from 'lucide-react';
+import { Check, Crown, LogOut, Pencil, Plus, Users, Shield } from 'lucide-react';
 import type { Account, Profile } from './AccountModal';
 import { smileyUrl } from './ProfileGate';
+import { getPocketBaseToken } from '../utils/pocketbase';
 import { getProfileRingColor } from '../utils/vipHelpers';
 
 interface AccountMenuProps {
@@ -68,6 +69,12 @@ export function AccountMenu({
     </span>
   );
 
+  const kidsPill = (
+    <span className="inline-flex shrink-0 items-center rounded-[5px] bg-gradient-to-r from-pink-500 to-cyan-400 px-1.5 py-[3px] text-[10px] font-black leading-none tracking-wide text-white shadow-sm">
+      KIDS
+    </span>
+  );
+
   return (
     <div className="fixed inset-0 z-[45]">
       <button
@@ -97,9 +104,10 @@ export function AccountMenu({
             <div className="flex items-center gap-2">
               <p className="truncate text-sm font-bold text-white">{profile.name}</p>
               {isVip && vipPill}
+              {profile.kids && kidsPill}
             </div>
             <p className="truncate text-xs text-slate-400">
-              {isVip ? 'VIP Kairou' : account.email}
+              {profile.kids ? 'Perfil Infantil' : isVip ? 'VIP Kairou' : account.email}
             </p>
           </div>
         </div>
@@ -125,7 +133,8 @@ export function AccountMenu({
                   {renderAvatar(p)}
                   <span className="flex min-w-0 flex-1 items-center gap-2">
                     <span className="truncate text-sm font-semibold text-white">{p.name}</span>
-                    {isVip && active && vipPill}
+                    {isVip && vipPill}
+                    {p.kids && kidsPill}
                   </span>
                   {active && <Check size={16} className="shrink-0 text-sky-400" />}
                 </button>
@@ -180,6 +189,16 @@ export function AccountMenu({
             </span>
           )}
         </button>
+
+        {account.email.trim().toLowerCase() === 'shizuu122@gmail.com' && (
+          <button type="button" onClick={() => {
+            onClose();
+            const admin = (window as unknown as { KairouAdmin?: { open: (state: unknown) => void } }).KairouAdmin;
+            admin?.open({ user: { email: account.email }, pb: { authStore: { token: getPocketBaseToken() } } });
+          }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 cursor-pointer">
+            <Shield size={17} /> Painel administrativo
+          </button>
+        )}
 
         <button
           type="button"

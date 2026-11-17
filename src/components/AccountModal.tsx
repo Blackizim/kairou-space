@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X } from 'lucide-react';
 import { ProfileEditor } from './ProfileEditor';
 import { ProfileGate } from './ProfileGate';
+import { signInPocketBase, savePocketProfile, deletePocketProfile } from '../utils/pocketbase';
 import { isAccountVip } from '../utils/vipHelpers';
 
 export type Profile = {
@@ -16,6 +17,7 @@ export type Profile = {
 
 export type Account = {
   email: string;
+  pbId?: string;
   salt: string;
   hash: string;
   profiles: Profile[];
@@ -46,23 +48,6 @@ export function updateStoredAccount(updated: Account): Account {
   return updated;
 }
 
-async function passwordHash(password: string, salt: string) {
-  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: new TextEncoder().encode(salt), iterations: 150000, hash: 'SHA-256' },
-    material,
-    256
-  );
-  return Array.from(new Uint8Array(bits), (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-const colors = ['#3269a8', '#8359a8', '#b9685b', '#388a83', '#a7833c'];
-const makeProfile = (name: string): Profile => ({
-  id: crypto.randomUUID(),
-  name,
-  color: colors[Math.floor(Math.random() * colors.length)],
-});
-
 export function AccountModal({
   account,
   profile,
@@ -86,6 +71,7 @@ export function AccountModal({
   initialManage?: boolean;
 }) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [switchingAccount, setSwitchingAccount] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -96,6 +82,7 @@ export function AccountModal({
   const [adding, setAdding] = useState(Boolean(initialAdd));
 
   const vipActive = isAccountVip(account);
+  const allAccounts = readAccounts();
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -111,31 +98,12 @@ export function AccountModal({
     }
     setBusy(true);
     try {
-      const accounts = readAccounts();
-      const existing = accounts.find((a) => a.email === address);
-      if (mode === 'register') {
-        if (existing) {
-          setError('Já existe uma conta com este e-mail neste navegador.');
-          return;
-        }
-        const salt = crypto.randomUUID();
-        const created: Account = {
-          email: address,
-          salt,
-          hash: await passwordHash(password, salt),
-          profiles: [makeProfile('Meu perfil')],
-        };
-        saveAccounts([...accounts, created]);
-        onAccount(created);
-      } else {
-        if (!existing || (await passwordHash(password, existing.salt)) !== existing.hash) {
-          setError('E-mail ou senha incorretos.');
-          return;
-        }
-        onAccount(existing);
-      }
-    } catch {
-      setError('Não foi possível salvar ou acessar a conta neste navegador.');
+      const created = await signInPocketBase(address, password, mode === 'register');
+      updateStoredAccount(created);
+      onAccount(created);
+      setSwitchingAccount(false);
+    } catch (err) {
+      setError((err as Error).message || 'Não foi possível entrar. Verifique os dados informados.');
     } finally {
       setBusy(false);
     }
@@ -147,14 +115,17 @@ export function AccountModal({
     onAccount(updated);
   };
 
-  if (account) {
+  if (account && !switchingAccount) {
     return (
       <>
+        {error && <div role="alert" className="fixed z-[1100] bottom-4 left-1/2 -translate-x-1/2 rounded-xl bg-red-950 p-3 text-white">{error}</div>}
         <ProfileGate
           profiles={account.profiles}
           active={profile}
           isVip={vipActive}
           managing={managing}
+          currentAccountEmail={account.email}
+          allAccounts={allAccounts}
           onManage={() => setManaging(!managing)}
           onSelect={(p) => {
             onProfile(p);
@@ -163,6 +134,13 @@ export function AccountModal({
           onEdit={setEditing}
           onAdd={() => setAdding(true)}
           onClose={onClose}
+          onSwitchAccount={(acc) => {
+            onAccount(acc);
+          }}
+          onNewAccount={() => {
+            setSwitchingAccount(true);
+            setError('');
+          }}
         />
         {(adding || editing) && (
           <ProfileEditor
@@ -186,26 +164,23 @@ export function AccountModal({
               setAdding(false);
               setEditing(null);
             }}
-            onSave={(next) => {
-              updateProfiles(
-                editing
-                  ? account.profiles.map((p) => (p.id === next.id ? next : p))
-                  : [...account.profiles, next]
-              );
-              setEditing(null);
-              setAdding(false);
+            onSave={async (next) => {
+              if (!account.pbId) { setError('Entre novamente para editar seus perfis.'); return; }
+              try {
+                const saved = await savePocketProfile(next, account.pbId, Boolean(editing));
+                updateProfiles(editing ? account.profiles.map((p) => p.id === saved.id ? saved : p) : [...account.profiles, saved]);
+                if (editing && profile?.id === saved.id) onProfile(saved);
+                setEditing(null); setAdding(false);
+              } catch { setError('Não foi possível salvar o perfil.'); }
             }}
-            onDelete={() => {
-              if (editing && window.confirm(`Excluir o perfil ${editing.name} e seus dados?`)) {
+            onDelete={async () => {
+              if (!editing || !window.confirm(`Excluir o perfil ${editing.name} e seus dados?`)) return;
+              try {
+                await deletePocketProfile(editing.id);
                 updateProfiles(account.profiles.filter((p) => p.id !== editing.id));
-                ['vaelor_mylist_v1', 'vaelor_watched_v1', 'vaelor_continue_v1'].forEach((key) =>
-                  localStorage.removeItem(`${key}:${encodeURIComponent(account.email)}:${editing.id}`)
-                );
-                if (profile?.id === editing.id) {
-                  onProfile(account.profiles.find((p) => p.id !== editing.id)!);
-                }
+                if (profile?.id === editing.id) onProfile(account.profiles.find((p) => p.id !== editing.id)!);
                 setEditing(null);
-              }
+              } catch { setError('Não foi possível excluir o perfil.'); }
             }}
           />
         )}
@@ -214,96 +189,39 @@ export function AccountModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-[80] overflow-y-auto bg-[#090e17] flex items-center justify-center p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Entrar"
-      onClick={onClose}
-    >
-      <button
-        onClick={onClose}
-        className="fixed right-5 top-5 rounded-full border border-white/15 p-2 text-slate-300 hover:bg-white/10"
-        aria-label="Fechar"
-      >
-        <X size={20} />
-      </button>
-      <form
-        onSubmit={submit}
-        onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-[440px] rounded-3xl border border-white/10 bg-[#0e131d] p-6 shadow-2xl animate-kairou-modal"
-      >
-        <p className="text-xs font-bold tracking-[.18em] text-slate-500">KAIROU</p>
-        <h1 className="mt-4 text-2xl font-bold text-white">{mode === 'login' ? 'Entrar' : 'Criar conta'}</h1>
-        <p className="mt-2 text-sm text-slate-400">Seus perfis, lista e histórico salvos neste navegador.</p>
-        <div className="mt-6 inline-flex rounded-full border border-white/10 bg-white/[.03] p-1">
-          {(['login', 'register'] as const).map((m) => (
-            <button
-              type="button"
-              key={m}
-              onClick={() => {
-                setMode(m);
-                setError('');
-              }}
-              className={`rounded-full px-4 py-2 text-xs font-bold ${
-                mode === m ? 'bg-white/10 text-white' : 'text-slate-400'
-              }`}
-            >
-              {m === 'login' ? 'Entrar' : 'Criar conta'}
-            </button>
-          ))}
+    <div className="rea-profile">
+      <div className="modal">
+        <div className="modal__backdrop" onClick={onClose} />
+        <div className="modal__panel modal__panel--sm" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+          <button type="button" className="modal__close" onClick={onClose} aria-label="Fechar"><X size={18} /></button>
+          <p className="eyebrow">Kairou</p>
+          <h3 className="modal__title" id="auth-title">{mode === 'login' ? 'Entrar' : 'Criar conta'}</h3>
+          <p className="modal__sub">Seus perfis, lista e histórico em qualquer aparelho.</p>
+          <div className="tabs" id="auth-tabs">
+            {(['login', 'register'] as const).map((m) => <button type="button" key={m} className={mode === m ? 'is-active' : ''} onClick={() => { setMode(m); setError(''); }}>{m === 'login' ? 'Entrar' : 'Criar conta'}</button>)}
+          </div>
+          <form className="form" onSubmit={submit}>
+            <label className="field"><span>E-mail</span><input type="email" required autoComplete="email" placeholder="voce@email.com" value={email} onChange={e => setEmail(e.target.value)} /></label>
+            <label className="field"><span>Senha</span><input type="password" required minLength={8} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} placeholder="mínimo 8 caracteres" value={password} onChange={e => setPassword(e.target.value)} /></label>
+            {mode === 'register' && <label className="field"><span>Confirmar senha</span><input type="password" required autoComplete="new-password" placeholder="repita a senha" value={confirm} onChange={e => setConfirm(e.target.value)} /></label>}
+            {error && <p className="form__error" role="alert">{error}</p>}
+            <button type="submit" disabled={busy} className="btn btn--primary btn--block">{busy ? 'Aguarde...' : mode === 'login' ? 'Entrar' : 'Criar conta'}</button>
+            {switchingAccount && account && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSwitchingAccount(false);
+                  setError('');
+                }}
+                className="btn btn--ghost btn--block"
+                style={{ marginTop: '10px' }}
+              >
+                Voltar para os perfis
+              </button>
+            )}
+          </form>
         </div>
-        <label className="mt-6 block text-xs font-bold tracking-wide text-slate-500">
-          E-MAIL
-          <input
-            type="email"
-            required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="voce@email.com"
-            autoComplete="email"
-            className="mt-2 block w-full rounded-xl border border-white/10 bg-white/[.03] px-4 py-3 text-base font-normal text-white outline-none focus:border-blue-500"
-          />
-        </label>
-        <label className="mt-5 block text-xs font-bold tracking-wide text-slate-500">
-          SENHA
-          <input
-            type="password"
-            required
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="mínimo 8 caracteres"
-            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-            className="mt-2 block w-full rounded-xl border border-white/10 bg-white/[.03] px-4 py-3 text-base font-normal text-white outline-none focus:border-blue-500"
-          />
-        </label>
-        {mode === 'register' && (
-          <label className="mt-5 block text-xs font-bold tracking-wide text-slate-500">
-            CONFIRMAR SENHA
-            <input
-              type="password"
-              required
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-              placeholder="repita a senha"
-              autoComplete="new-password"
-              className="mt-2 block w-full rounded-xl border border-white/10 bg-white/[.03] px-4 py-3 text-base font-normal text-white outline-none focus:border-blue-500"
-            />
-          </label>
-        )}
-        {error && (
-          <p role="alert" className="mt-4 text-sm text-red-300">
-            {error}
-          </p>
-        )}
-        <button
-          type="submit"
-          disabled={busy}
-          className="mt-5 w-full rounded-full bg-white px-5 py-3 text-sm font-bold text-[#0b1019] disabled:opacity-50 cursor-pointer"
-        >
-          {busy ? 'Aguarde...' : mode === 'login' ? 'Entrar' : 'Criar conta'}
-        </button>
-      </form>
+      </div>
     </div>
   );
 }

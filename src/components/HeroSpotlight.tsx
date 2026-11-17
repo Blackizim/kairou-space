@@ -92,8 +92,6 @@ export const HeroSpotlight: React.FC<HeroSpotlightProps> = ({
               <Swords className="w-3.5 h-3.5 text-stone-300" />
               {current.genres.slice(0, 2).join(', ')}
             </span>
-            <span aria-hidden="true" className="text-stone-500">·</span>
-            <span className="font-display font-medium tracking-wide text-xs text-stone-200">{current.qualityBadge}</span>
           </div>
 
           <p className="text-sm sm:text-[15px] text-stone-200/90 leading-relaxed line-clamp-3">

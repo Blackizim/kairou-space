@@ -1,3 +1,4 @@
+import { PlayerAd } from './PlayerAd';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
@@ -6,13 +7,15 @@ import {
   Check,
   ChevronRight,
   Clock,
+  Crown,
   Gauge,
   Globe,
   GripVertical,
+  Lock,
   Maximize2,
   Minimize2,
+  Music,
   Pause,
-  PictureInPicture2,
   Play,
   RotateCcw,
   RotateCw,
@@ -21,6 +24,7 @@ import {
   Settings,
   SkipForward,
   Subtitles,
+  Tv,
   Type,
   Upload,
   Volume2,
@@ -104,7 +108,7 @@ function SubtitleLanguageIcon({ lang, label }: { lang: string; label: string }) 
 }
 
 type PopoverPanel = null | 'servers' | 'subtitles' | 'settings';
-type SettingsSubPanel = 'main' | 'quality' | 'timer' | 'speed' | 'substyle';
+type SettingsSubPanel = 'main' | 'quality' | 'audio' | 'timer' | 'speed' | 'substyle';
 
 interface CinemaPlayerProps {
   item: MediaTitle;
@@ -113,8 +117,11 @@ interface CinemaPlayerProps {
   streams: AnonymizedStream[];
   subtitles: AnonymizedSubtitle[];
   isPreparing?: boolean;
+  isVip?: boolean;
+  onRequireVip?: () => void;
   initialStreamIndex?: number;
   resumeAtSec?: number;
+  preferPtBr?: boolean;
   defaultSubtitlesOn?: boolean;
   autoplayNextEpisode?: boolean;
   subtitleStyle: SubtitleStyleConfig;
@@ -132,8 +139,11 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   streams,
   subtitles,
   isPreparing = false,
+  isVip = false,
+  onRequireVip,
   initialStreamIndex = 0,
   resumeAtSec = 0,
+  preferPtBr = true,
   defaultSubtitlesOn = false,
   autoplayNextEpisode = true,
   subtitleStyle,
@@ -156,6 +166,8 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   const hlsNetworkRetriesRef = useRef<number>(0);
   const maxSub1080LevelRef = useRef<number>(-1);
   const manualStreamOverrideRef = useRef<boolean>(initialStreamIndex > 0);
+  const emptyStreamsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRefreshedRef = useRef(false);
 
   const supportsHevc = useMemo(
     () =>
@@ -240,6 +252,21 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   const [openPanel, setOpenPanel] = useState<PopoverPanel>(null);
   const [settingsSub, setSettingsSub] = useState<SettingsSubPanel>('main');
 
+  // ProfitOn Watching Ads lifecycle (Zero ads for VIP, purge on player unmount)
+  useEffect(() => {
+    const win = typeof window !== 'undefined' ? (window as unknown as { KairouAds?: { loadWatchingAds: () => void; disableAds: () => void } }) : undefined;
+    win?.KairouAds?.loadWatchingAds();
+    return () => {
+      win?.KairouAds?.disableAds();
+    };
+  }, []);
+
+  // Audio tracks state (for multi-audio HLS streams)
+  const [audioTracks, setAudioTracks] = useState<
+    Array<{ id: number; name: string; lang?: string; isPtBr?: boolean }>
+  >([]);
+  const [selectedAudioTrack, setSelectedAudioTrack] = useState<number>(-1);
+
   // Subtitles state
   const [uploadedSubs, setUploadedSubs] = useState<AnonymizedSubtitle[]>([]);
   const [activeSubId, setActiveSubId] = useState<string | null>(() => {
@@ -259,6 +286,19 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   const [skipSegments, setSkipSegments] = useState<SkipSegment[]>([]);
   const [hasEnded, setHasEnded] = useState(false);
   const [nextEpDismissed, setNextEpDismissed] = useState(false);
+
+  // Cast / AirPlay / TV state (matching REA COPIA)
+  const [castState, setCastState] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [castToast, setCastToast] = useState<string | null>(null);
+  const castToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showCastToast = useCallback((msg: string) => {
+    if (castToastTimerRef.current) clearTimeout(castToastTimerRef.current);
+    setCastToast(msg);
+    castToastTimerRef.current = setTimeout(() => {
+      setCastToast(null);
+    }, 3500);
+  }, []);
 
   // Fetch exact intro/recap/outro timestamps for series and anime
   useEffect(() => {
@@ -293,6 +333,10 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   // via SSE BEFORE the first frame renders, automatically upgrade to 1080p.
   useEffect(() => {
     if (lockedStream) {
+      if (emptyStreamsTimeoutRef.current) {
+        clearTimeout(emptyStreamsTimeoutRef.current);
+        emptyStreamsTimeoutRef.current = null;
+      }
       if (
         !manualStreamOverrideRef.current &&
         !hasFirstFrame &&
@@ -320,6 +364,10 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     }
 
     if (streams.length > 0) {
+      if (emptyStreamsTimeoutRef.current) {
+        clearTimeout(emptyStreamsTimeoutRef.current);
+        emptyStreamsTimeoutRef.current = null;
+      }
       const nextPick = pickNextAutoStream(streams, !isPreparing);
       if (nextPick) {
         setStreamIndex(nextPick.idx);
@@ -329,15 +377,28 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       }
     }
 
+    // When streams is empty, don't fail immediately — give background extraction a 15s grace window
+    if (streams.length === 0) {
+      if (!isPreparing && !autoRefreshedRef.current) {
+        autoRefreshedRef.current = true;
+        onRefreshStreams();
+      }
+      if (!emptyStreamsTimeoutRef.current && !errorMsg) {
+        emptyStreamsTimeoutRef.current = setTimeout(() => {
+          if (streams.length === 0 && !lockedStream) {
+            setIsBuffering(false);
+            setErrorMsg('Nenhum servidor disponível para este título no momento. Tente recarregar.');
+          }
+        }, 15000);
+      }
+      return;
+    }
+
     if (!isPreparing && !errorMsg) {
       setIsBuffering(false);
-      setErrorMsg(
-        streams.length === 0
-          ? 'Nenhum servidor disponível para este título no momento. Tente recarregar.'
-          : 'Não foi possível reproduzir os servidores encontrados neste navegador.'
-      );
+      setErrorMsg('Não foi possível reproduzir os servidores encontrados neste navegador.');
     }
-  }, [streams, lockedStream, streamIndex, hasFirstFrame, isPreparing, errorMsg, isStreamBrowserCompatible, pickNextAutoStream]);
+  }, [streams, lockedStream, streamIndex, hasFirstFrame, isPreparing, errorMsg, isStreamBrowserCompatible, pickNextAutoStream, onRefreshStreams]);
 
   const activeStream = lockedStream;
   const allSubtitles = useMemo(
@@ -456,6 +517,8 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     setLevels([]);
     setActiveLevel(-1);
     setCurrentAutoLevelIdx(-1);
+    setAudioTracks([]);
+    setSelectedAudioTrack(-1);
 
     // Check HEVC incompatibility upfront
     if (!isStreamBrowserCompatible(activeStream)) {
@@ -573,8 +636,86 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
           setCurrentAutoLevelIdx(bestSub1080Idx);
         }
 
+        const parseAudioTracks = () => {
+          if (!hls.audioTracks || hls.audioTracks.length === 0) return;
+          const parsed = hls.audioTracks.map((t, idx) => {
+            const rawName = (t.name || '').trim();
+            const rawLang = (t.lang || '').trim().toLowerCase();
+            const isPt = /por|pt|dub|bra/i.test(`${rawName} ${rawLang}`);
+            const isEn = /eng|en|ing/i.test(`${rawName} ${rawLang}`);
+            const isEs = /esp|es|spa/i.test(`${rawName} ${rawLang}`);
+            const isJp = /jpn|ja|jap/i.test(`${rawName} ${rawLang}`);
+
+            let name = rawName || (rawLang ? rawLang.toUpperCase() : `Faixa ${idx + 1}`);
+            if (isPt && !/portugu[eê]s|pt/i.test(name)) name = `Português (${name})`;
+            else if (isEn && !/ingl[eê]s|english/i.test(name)) name = `Inglês (${name})`;
+            else if (isEs && !/espanhol|spanish/i.test(name)) name = `Espanhol (${name})`;
+            else if (isJp && !/japon[eê]s|japanese/i.test(name)) name = `Japonês (${name})`;
+
+            return {
+              id: t.id ?? idx,
+              name,
+              lang: t.lang || '',
+              isPtBr: isPt,
+            };
+          });
+          setAudioTracks(parsed);
+          setSelectedAudioTrack(hls.audioTrack);
+
+          if (preferPtBr && parsed.length > 1) {
+            const ptIdx = parsed.findIndex((p) => p.isPtBr);
+            if (ptIdx !== -1 && hls.audioTrack !== parsed[ptIdx].id) {
+              hls.audioTrack = parsed[ptIdx].id;
+              setSelectedAudioTrack(parsed[ptIdx].id);
+            }
+          }
+        };
+
+        parseAudioTracks();
         seekResumeIfNeeded();
         startPlayback();
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+        if (cancelled) return;
+        if (!hls.audioTracks || hls.audioTracks.length === 0) return;
+        const parsed = hls.audioTracks.map((t, idx) => {
+          const rawName = (t.name || '').trim();
+          const rawLang = (t.lang || '').trim().toLowerCase();
+          const isPt = /por|pt|dub|bra/i.test(`${rawName} ${rawLang}`);
+          const isEn = /eng|en|ing/i.test(`${rawName} ${rawLang}`);
+          const isEs = /esp|es|spa/i.test(`${rawName} ${rawLang}`);
+          const isJp = /jpn|ja|jap/i.test(`${rawName} ${rawLang}`);
+
+          let name = rawName || (rawLang ? rawLang.toUpperCase() : `Faixa ${idx + 1}`);
+          if (isPt && !/portugu[eê]s|pt/i.test(name)) name = `Português (${name})`;
+          else if (isEn && !/ingl[eê]s|english/i.test(name)) name = `Inglês (${name})`;
+          else if (isEs && !/espanhol|spanish/i.test(name)) name = `Espanhol (${name})`;
+          else if (isJp && !/japon[eê]s|japanese/i.test(name)) name = `Japonês (${name})`;
+
+          return {
+            id: t.id ?? idx,
+            name,
+            lang: t.lang || '',
+            isPtBr: isPt,
+          };
+        });
+        setAudioTracks(parsed);
+        setSelectedAudioTrack(hls.audioTrack);
+
+        if (preferPtBr && parsed.length > 1) {
+          const ptIdx = parsed.findIndex((p) => p.isPtBr);
+          if (ptIdx !== -1 && hls.audioTrack !== parsed[ptIdx].id) {
+            hls.audioTrack = parsed[ptIdx].id;
+            setSelectedAudioTrack(parsed[ptIdx].id);
+          }
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_e, data) => {
+        if (!cancelled) {
+          setSelectedAudioTrack(data.id);
+        }
       });
 
       hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
@@ -755,13 +896,110 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     }
   };
 
-  const togglePip = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (document.pictureInPictureElement) {
-      document.exitPictureInPicture?.().catch(() => {});
-    } else if (document.pictureInPictureEnabled) {
-      v.requestPictureInPicture?.().catch(() => {});
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    try {
+      (video as any).webkitWirelessVideoPlaybackDisabled = false;
+      (video as any).disableRemotePlayback = false;
+    } catch {}
+
+    const onConnecting = () => {
+      setCastState('connecting');
+      showCastToast('Conectando ao dispositivo...');
+    };
+    const onConnect = () => {
+      setCastState('connected');
+      showCastToast('Conectado! Reproduzindo na TV.');
+    };
+    const onDisconnect = () => {
+      setCastState('disconnected');
+      showCastToast('Desconectado da TV.');
+    };
+
+    const remote = (video as any).remote;
+    if (remote && typeof remote.addEventListener === 'function') {
+      remote.addEventListener('connecting', onConnecting);
+      remote.addEventListener('connect', onConnect);
+      remote.addEventListener('disconnect', onDisconnect);
+    }
+
+    const onWirelessChanged = () => {
+      const isWireless = Boolean((video as any).webkitCurrentPlaybackTargetIsWireless);
+      setCastState(isWireless ? 'connected' : 'disconnected');
+      if (isWireless) {
+        showCastToast('Conectado via AirPlay! Transmitindo vídeo e áudio.');
+      } else {
+        showCastToast('AirPlay desconectado.');
+      }
+    };
+
+    video.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', onWirelessChanged);
+
+    return () => {
+      if (remote && typeof remote.removeEventListener === 'function') {
+        remote.removeEventListener('connecting', onConnecting);
+        remote.removeEventListener('connect', onConnect);
+        remote.removeEventListener('disconnect', onDisconnect);
+      }
+      video.removeEventListener('webkitcurrentplaybacktargetiswirelesschanged', onWirelessChanged);
+    };
+  }, [showCastToast]);
+
+  const handleCast = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Se for WebKit e HLS estiver ativo, migra para a URL nativa antes de abrir o picker (AirPlay)
+    if (
+      typeof (video as any).webkitShowPlaybackTargetPicker === 'function' &&
+      hlsRef.current &&
+      activeStream?.streamUrl
+    ) {
+      const curTime = video.currentTime || 0;
+      const wasPlaying = !video.paused;
+      try {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      } catch {}
+      const absUrl = activeStream.streamUrl.startsWith('http')
+        ? activeStream.streamUrl
+        : new URL(activeStream.streamUrl, window.location.href).href;
+      video.removeAttribute('src');
+      video.load();
+      video.src = absUrl;
+      video.load();
+      if (curTime > 0) {
+        try {
+          video.currentTime = curTime;
+        } catch {}
+      }
+      if (wasPlaying) {
+        video.play().catch(() => {});
+      }
+    }
+
+    try {
+      // 1. WebKit AirPlay picker (iOS / macOS Safari)
+      if (typeof (video as any).webkitShowPlaybackTargetPicker === 'function') {
+        (video as any).webkitShowPlaybackTargetPicker();
+        return;
+      }
+
+      // 2. Remote Playback API (Chrome → Chromecast / Android)
+      const remote = (video as any).remote;
+      if (remote && typeof remote.prompt === 'function') {
+        await remote.prompt();
+        return;
+      }
+
+      // 3. Fallback informativo
+      showCastToast('Seu navegador não suporta transmissão direta. No iPhone/iPad, use o Safari.');
+    } catch (err: any) {
+      if (err?.name === 'NotAllowedError') return; // Usuário cancelou a seleção
+      console.warn('Cast error:', err);
+      showCastToast('Erro ao conectar. Verifique se a TV está na mesma rede Wi-Fi.');
     }
   };
 
@@ -856,6 +1094,26 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       ? (levels.find((l) => l.index === currentAutoLevelIdx)?.label ?? activeStream?.quality ?? 'Auto')
       : levels.find((l) => l.index === activeLevel)?.label ?? activeStream?.quality ?? 'Auto';
 
+  const alternativeAudioStreams = useMemo(() => {
+    if (!activeStream) return [];
+    return streams
+      .map((stream, index) => ({ stream, index }))
+      .filter(
+        ({ stream }) =>
+          stream.id !== activeStream.id &&
+          stream.isPtBr !== activeStream.isPtBr &&
+          isStreamBrowserCompatible(stream)
+      );
+  }, [streams, activeStream, isStreamBrowserCompatible]);
+
+  const currentAudioDisplayLabel = useMemo(() => {
+    if (audioTracks.length > 1 && selectedAudioTrack !== -1) {
+      const activeTrack = audioTracks.find((t) => t.id === selectedAudioTrack);
+      if (activeTrack) return activeTrack.name;
+    }
+    return activeStream?.isPtBr ? 'PT-BR · Dublado' : activeStream?.audio || 'Original';
+  }, [audioTracks, selectedAudioTrack, activeStream]);
+
   const subtitleFontSizeClass =
     subtitleStyle.fontSize === 'sm'
       ? 'text-sm sm:text-base'
@@ -870,6 +1128,7 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       onTouchStart={bumpControls}
       className="fixed inset-0 z-50 bg-black text-white select-none overflow-hidden flex items-center justify-center"
     >
+      {hasFirstFrame && isPlaying && <PlayerAd isVip={isVip} />}
       {/* Hidden local subtitle file input */}
       <input
         ref={fileInputRef}
@@ -883,6 +1142,8 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       <video
         ref={videoRef}
         playsInline
+        {...{ airplay: 'allow', 'x-webkit-airplay': 'allow' }}
+        disableRemotePlayback={false}
         crossOrigin="anonymous"
         onClick={() => {
           if (openPanel) {
@@ -983,8 +1244,10 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
                 {item.mediaType === 'series' && season && episode ? ` · T${season}E${episode}` : ''}
               </h2>
               <p className="text-xs sm:text-sm text-stone-300 tracking-wide">
-                {!activeStream && isPreparing
-                  ? 'Preparando sala de cinema em alta definição...'
+                {!activeStream
+                  ? streams.length === 0
+                    ? 'Localizando os melhores servidores de transmissão...'
+                    : 'Preparando sala de cinema em alta definição...'
                   : 'Sincronizando áudio e vídeo...'}
               </p>
             </div>
@@ -1039,13 +1302,51 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
 
         <button
           type="button"
-          onClick={togglePip}
-          aria-label="Picture-in-Picture"
-          className="w-10 h-10 rounded-full bg-white/12 hover:bg-white/22 backdrop-blur-md flex items-center justify-center text-white transition-colors cursor-pointer"
+          onClick={handleCast}
+          aria-label="Transmitir para TV"
+          title={
+            castState === 'connected'
+              ? 'Transmitindo na TV'
+              : castState === 'connecting'
+              ? 'Conectando à TV...'
+              : 'Transmitir para TV (AirPlay / Chromecast)'
+          }
+          className={`w-10 h-10 rounded-full backdrop-blur-md flex items-center justify-center transition-all cursor-pointer ${
+            castState === 'connected'
+              ? 'text-sky-400 bg-sky-500/20 ring-2 ring-sky-400/50 shadow-[0_0_15px_rgba(56,189,248,0.5)]'
+              : castState === 'connecting'
+              ? 'text-amber-400 bg-amber-500/20 ring-1 ring-amber-400/40 animate-pulse'
+              : 'text-white bg-white/12 hover:bg-white/22'
+          }`}
         >
-          <PictureInPicture2 className="w-4 h-4" />
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6M2 20h.01" />
+          </svg>
         </button>
       </div>
+
+      {/* Floating Cast / AirPlay Toast notification */}
+      {castToast && (
+        <div className="absolute top-20 inset-x-0 z-50 flex justify-center pointer-events-none px-4">
+          <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-black/85 backdrop-blur-xl border border-white/20 text-white text-xs sm:text-sm font-medium shadow-2xl">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                castState === 'connected' ? 'bg-sky-400' : 'bg-amber-400 animate-ping'
+              }`}
+            />
+            <span>{castToast}</span>
+          </div>
+        </div>
+      )}
 
       {/* Center -10s / Play-Pause / +10s Controls (once first frame loaded) */}
       {!errorMsg && hasFirstFrame && (
@@ -1154,11 +1455,17 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
             ) : (
               streams.map((st, idx) => {
                 const selected = activeStream ? st.id === activeStream.id : false;
+                const is4kStream = isUltraHdQuality(st.quality) || /4k|2160p/i.test(st.label);
+                const locked = is4kStream && !isVip;
                 return (
                   <button
                     key={st.id}
                     type="button"
                     onClick={() => {
+                      if (locked) {
+                        onRequireVip?.();
+                        return;
+                      }
                       manualStreamOverrideRef.current = true;
                       triedIdsRef.current.clear();
                       setErrorMsg(null);
@@ -1176,18 +1483,31 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
                       <GripVertical className="w-4 h-4 text-stone-500 shrink-0" strokeWidth={1.75} />
                       <SubtitleLanguageIcon lang={st.isPtBr ? 'pt-BR' : ''} label={st.audio} />
                       <div className="min-w-0">
-                        <p className="text-sm font-bold text-white truncate">{st.label}</p>
+                        <div className="flex items-center gap-1.5">
+                          <p className="text-sm font-bold text-white truncate">{st.label}</p>
+                          {is4kStream && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-black uppercase tracking-wider bg-gradient-to-r from-amber-400 to-yellow-500 text-stone-950">
+                              <Crown className="w-2.5 h-2.5 fill-stone-950" />
+                              VIP
+                            </span>
+                          )}
+                        </div>
                         <p className="text-[11px] text-stone-300 truncate">
                           {st.quality} · {st.audio}
                         </p>
                       </div>
                     </div>
 
-                    {selected && (
+                    {locked ? (
+                      <span className="flex items-center gap-1 text-[11px] font-bold text-amber-400 shrink-0">
+                        <Lock className="w-3.5 h-3.5" />
+                        <span>VIP</span>
+                      </span>
+                    ) : selected ? (
                       <span className="w-6 h-6 rounded-full bg-[#2EE58D] text-stone-950 flex items-center justify-center shrink-0">
                         <Check className="w-3.5 h-3.5 stroke-[3]" />
                       </span>
-                    )}
+                    ) : null}
                   </button>
                 );
               })
@@ -1352,73 +1672,65 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
         >
           {settingsSub === 'main' && (
             <>
-              {/* 2x2 Bento Quick Cards matching Screenshot 8 */}
-              <div className="grid grid-cols-2 gap-2.5">
+              {/* 2x2 Bento Quick Cards matching Attachment 2 (media_1794685753631_6851d904) */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '10px' }} className="w-full">
+                {/* 1. QUALITY */}
                 <button
                   type="button"
                   onClick={() => setSettingsSub('quality')}
-                  className="rounded-xl bg-white/[0.04] hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer"
+                  className="rounded-2xl bg-[#1c1f2a]/95 hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer flex flex-col justify-between"
                 >
-                  <p className="text-[10px] font-display font-medium uppercase tracking-wider text-stone-400">
-                    QUALIDADE
-                  </p>
-                  <p className="text-sm font-bold text-white truncate mt-0.5">
-                    {activeQualityLabel}
+                  <div className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-wider text-stone-400">
+                    <Tv className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                    <span>QUALITY</span>
+                  </div>
+                  <p className="text-sm font-bold text-white truncate mt-1">
+                    {activeQualityLabel.replace(' Full HD', '').replace(' (2160p)', '') || '1080p'}
                   </p>
                 </button>
 
+                {/* 2. SERVER */}
                 <button
                   type="button"
                   onClick={() => setOpenPanel('servers')}
-                  className="rounded-xl bg-white/[0.04] hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer"
+                  className="rounded-2xl bg-[#1c1f2a]/95 hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer flex flex-col justify-between"
                 >
-                  <p className="text-[10px] font-display font-medium uppercase tracking-wider text-stone-400">
-                    SERVIDOR
-                  </p>
-                  <p className="text-sm font-bold text-white truncate mt-0.5">
+                  <div className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-wider text-stone-400">
+                    <Server className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                    <span>SERVER</span>
+                  </div>
+                  <p className="text-sm font-bold text-white truncate mt-1">
                     {activeStream?.label ?? 'Servidor 1'}
                   </p>
                 </button>
 
+                {/* 3. SUBTITLES */}
                 <button
                   type="button"
                   onClick={() => setOpenPanel('subtitles')}
-                  className="rounded-xl bg-white/[0.04] hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer"
+                  className="rounded-2xl bg-[#1c1f2a]/95 hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer flex flex-col justify-between"
                 >
-                  <p className="text-[10px] font-display font-medium uppercase tracking-wider text-stone-400">
-                    LEGENDAS
-                  </p>
-                  <p className="text-sm font-bold text-white truncate mt-0.5">
-                    {activeSubObj?.label ?? 'Desativado'}
+                  <div className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-wider text-stone-400">
+                    <Subtitles className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                    <span>SUBTITLES</span>
+                  </div>
+                  <p className="text-sm font-bold text-white truncate mt-1">
+                    {activeSubObj?.label ?? 'Off'}
                   </p>
                 </button>
 
+                {/* 4. AUDIO */}
                 <button
                   type="button"
-                  onClick={() => {
-                    const altIdx = streams.findIndex(
-                      (s) =>
-                        s.id !== activeStream?.id &&
-                        s.isPtBr !== activeStream?.isPtBr &&
-                        isStreamBrowserCompatible(s)
-                    );
-                    if (altIdx !== -1 && streams[altIdx]) {
-                      manualStreamOverrideRef.current = true;
-                      triedIdsRef.current.clear();
-                      setErrorMsg(null);
-                      setStreamIndex(altIdx);
-                      setLockedStream(streams[altIdx]);
-                    } else {
-                      setOpenPanel('servers');
-                    }
-                  }}
-                  className="rounded-xl bg-white/[0.04] hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer"
+                  onClick={() => setSettingsSub('audio')}
+                  className="rounded-2xl bg-[#1c1f2a]/95 hover:bg-white/10 border border-white/10 p-3 text-left transition-colors cursor-pointer flex flex-col justify-between"
                 >
-                  <p className="text-[10px] font-display font-medium uppercase tracking-wider text-stone-400">
-                    ÁUDIO
-                  </p>
-                  <p className="text-sm font-bold text-white truncate mt-0.5">
-                    {activeStream?.isPtBr ? 'PT-BR' : 'Original'}
+                  <div className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-wider text-stone-400">
+                    <Music className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                    <span>AUDIO</span>
+                  </div>
+                  <p className="text-sm font-bold text-white truncate mt-1">
+                    {activeStream?.isPtBr ? 'Dublado' : (currentAudioDisplayLabel || 'Original')}
                   </p>
                 </button>
               </div>
@@ -1520,20 +1832,142 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
                   <span>Automático (Adaptativo)</span>
                   {activeLevel === -1 && <Check className="w-4 h-4 text-[#2EE58D]" />}
                 </button>
-                {levels.map((lvl) => (
-                  <button
-                    key={lvl.index}
-                    type="button"
-                    onClick={() => handleLevelSelect(lvl.index)}
-                    className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-sm cursor-pointer ${
-                      activeLevel === lvl.index ? 'bg-white/15 font-semibold' : 'hover:bg-white/8'
-                    }`}
-                  >
-                    <span>{lvl.label}</span>
-                    {activeLevel === lvl.index && <Check className="w-4 h-4 text-[#2EE58D]" />}
-                  </button>
-                ))}
+                {levels.map((lvl) => {
+                  const is4k = lvl.label.includes('4K') || lvl.label.includes('2160');
+                  const locked = is4k && !isVip;
+                  return (
+                    <button
+                      key={lvl.index}
+                      type="button"
+                      onClick={() => {
+                        if (locked) {
+                          onRequireVip?.();
+                          return;
+                        }
+                        handleLevelSelect(lvl.index);
+                      }}
+                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-sm cursor-pointer transition-colors ${
+                        activeLevel === lvl.index ? 'bg-white/15 font-semibold text-white' : 'hover:bg-white/8 text-stone-300'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>{lvl.label}</span>
+                        {is4k && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wider bg-gradient-to-r from-amber-400 to-yellow-500 text-stone-950 shadow-sm">
+                            <Crown className="w-2.5 h-2.5 fill-stone-950" />
+                            VIP
+                          </span>
+                        )}
+                      </span>
+                      {locked ? (
+                        <span className="flex items-center gap-1 text-xs text-amber-400 font-semibold">
+                          <Lock className="w-3.5 h-3.5" />
+                          <span>Bloqueado</span>
+                        </span>
+                      ) : activeLevel === lvl.index ? (
+                        <Check className="w-4 h-4 text-[#2EE58D]" />
+                      ) : null}
+                    </button>
+                  );
+                })}
               </div>
+            </div>
+          )}
+
+          {settingsSub === 'audio' && (
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={() => setSettingsSub('main')}
+                className="flex items-center gap-2 text-xs font-semibold text-stone-300 hover:text-white cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" /> Voltar · Seleção de Áudio
+              </button>
+
+              {audioTracks.length > 1 ? (
+                <div className="space-y-1.5">
+                  <p className="text-[11px] font-medium text-stone-400 uppercase tracking-wider">
+                    Faixas deste Servidor ({activeStream?.label ?? 'Atual'})
+                  </p>
+                  <div className="space-y-1 max-h-52 overflow-y-auto no-scrollbar">
+                    {audioTracks.map((track) => {
+                      const isSelected = selectedAudioTrack === track.id;
+                      return (
+                        <button
+                          key={track.id}
+                          type="button"
+                          onClick={() => {
+                            if (hlsRef.current) {
+                              hlsRef.current.audioTrack = track.id;
+                              setSelectedAudioTrack(track.id);
+                            }
+                          }}
+                          className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-sm cursor-pointer transition-colors ${
+                            isSelected
+                              ? 'bg-white/15 font-semibold text-white'
+                              : 'hover:bg-white/8 text-stone-300'
+                          }`}
+                        >
+                          <span className="flex items-center gap-2">
+                            <span>{track.name}</span>
+                            {track.isPtBr && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-medium">
+                                PT-BR
+                              </span>
+                            )}
+                          </span>
+                          {isSelected && <Check className="w-4 h-4 text-[#2EE58D]" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 rounded-xl bg-white/[0.03] border border-white/8 space-y-1">
+                  <p className="text-xs font-semibold text-white">
+                    {activeStream?.audio || (activeStream?.isPtBr ? 'PT-BR · Dublado' : 'Áudio Original')}
+                  </p>
+                  <p className="text-[11px] text-stone-400">
+                    {activeStream?.isPtBr
+                      ? 'Este servidor transmite com áudio em português.'
+                      : 'Este servidor transmite com áudio original.'}
+                  </p>
+                </div>
+              )}
+
+              {alternativeAudioStreams.length > 0 && (
+                <div className="space-y-1.5 pt-2 border-t border-white/10">
+                  <p className="text-[11px] font-medium text-stone-400 uppercase tracking-wider">
+                    {activeStream?.isPtBr
+                      ? 'Servidores com Áudio Original'
+                      : 'Servidores com Áudio Dublado PT-BR'}
+                  </p>
+                  <div className="space-y-1 max-h-40 overflow-y-auto no-scrollbar">
+                    {alternativeAudioStreams.map((alt) => (
+                      <button
+                        key={alt.stream.id}
+                        type="button"
+                        onClick={() => {
+                          manualStreamOverrideRef.current = true;
+                          triedIdsRef.current.clear();
+                          setErrorMsg(null);
+                          setStreamIndex(alt.index);
+                          setLockedStream(alt.stream);
+                          setSettingsSub('main');
+                        }}
+                        className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs hover:bg-white/8 text-stone-300 hover:text-white cursor-pointer transition-colors"
+                      >
+                        <span className="flex items-center gap-2 truncate">
+                          <span className="font-semibold text-white">{alt.stream.label}</span>
+                          <span className="text-stone-400">· {alt.stream.quality}</span>
+                          <span className="text-stone-400">({alt.stream.audio})</span>
+                        </span>
+                        <ChevronRight className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
