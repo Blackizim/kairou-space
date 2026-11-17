@@ -2,9 +2,10 @@
 set -e
 
 echo "=== 1. BAIXANDO NOVO SERVER.MJS COMPILADO ==="
-curl -sL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist-server/server.mjs -o /var/www/kairou/server.mjs
+curl -4 -fsSL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist-server/server.mjs -o /var/www/kairou/server.mjs
 mkdir -p /var/www/kairou/server
 echo "import '../server.mjs';" > /var/www/kairou/server/server.js
+echo "[OK] server.mjs baixado com sucesso!"
 
 echo "=== 2. ATUALIZANDO NGINX ==="
 python3 -c "
