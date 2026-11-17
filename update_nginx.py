@@ -28,16 +28,26 @@ def run_remote(cmd):
 with sftp.file('/etc/nginx/sites-available/kairou', 'r') as f:
     conf = f.read().decode('utf-8')
 
-old_line = "location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send) {"
-new_line = "location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health) {"
+target1 = "location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health) {"
+target2 = "location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send) {"
+replacement = "location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health|analytics|urgent-announcement) {"
 
-if old_line in conf:
-    conf = conf.replace(old_line, new_line)
-    with sftp.file('/etc/nginx/sites-available/kairou', 'w') as f:
-        f.write(conf)
-    print("Nginx configuration updated!")
-else:
-    print("Old line not found in conf or already updated.")
+if target1 in conf:
+    conf = conf.replace(target1, replacement)
+    print("Replaced target1 with analytics in Nginx conf.")
+elif target2 in conf:
+    conf = conf.replace(target2, replacement)
+    print("Replaced target2 with analytics in Nginx conf.")
+
+if 'proxy_buffering off;' not in conf and 'proxy_pass http://127.0.0.1:3001;' in conf:
+    conf = conf.replace(
+        'proxy_pass http://127.0.0.1:3001;',
+        'proxy_pass http://127.0.0.1:3001;\n        proxy_buffering off;\n        proxy_cache off;\n        proxy_read_timeout 300s;'
+    )
+    print("Added SSE / proxy_buffering off settings.")
+
+with sftp.file('/etc/nginx/sites-available/kairou', 'w') as f:
+    f.write(conf)
 
 run_remote('nginx -t && systemctl reload nginx')
 

@@ -16,7 +16,38 @@ LOCAL_DIR = r'c:\Users\shizu\Downloads\kairou\kaiii2'
 print("=== DEPLOYING TO ALEXHOST VPS ===")
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect(VPS_HOST, port=22, username=VPS_USER, password=VPS_PASS, timeout=15)
+
+key_path = r'C:\Users\shizu\.ssh\id_devman'
+connected = False
+
+# Try SSH key first
+if os.path.exists(key_path):
+    try:
+        print("Tentando conexao com chave SSH (id_devman)...")
+        pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
+        ssh.connect(VPS_HOST, port=22, username=VPS_USER, pkey=pkey, timeout=10, look_for_keys=False, allow_agent=False)
+        connected = True
+        print("Conectado com sucesso via chave SSH!")
+    except Exception as e:
+        print(f"Tentativa com chave SSH falhou ({e}), tentando senha...")
+
+if not connected:
+    for attempt in range(3):
+        try:
+            print(f"Connecting to {VPS_HOST} com senha (attempt {attempt+1})...")
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(VPS_HOST, port=22, username=VPS_USER, password=VPS_PASS, timeout=15, look_for_keys=False, allow_agent=False)
+            connected = True
+            break
+        except Exception as e:
+            print(f"Connection attempt {attempt+1} failed: {e}")
+            time.sleep(3)
+
+if not connected:
+    print("Could not connect to VPS.")
+    sys.exit(1)
+
 sftp = ssh.open_sftp()
 
 def run_remote(cmd):
@@ -82,16 +113,27 @@ nginx_update_py = '''
 with open('/etc/nginx/sites-available/kairou', 'r') as f:
     content = f.read()
 
-target = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip)'
-replacement = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health)'
+target1 = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health)'
+target2 = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip)'
+replacement = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health|analytics|urgent-announcement)'
 
-if target in content and replacement not in content:
-    content = content.replace(target, replacement)
-    with open('/etc/nginx/sites-available/kairou', 'w') as f:
-        f.write(content)
-    print("Nginx config updated successfully.")
-else:
-    print("Nginx config already up to date or target pattern not matched.")
+if target1 in content:
+    content = content.replace(target1, replacement)
+    print("Replaced target1 with full regex (including analytics).")
+elif target2 in content:
+    content = content.replace(target2, replacement)
+    print("Replaced target2 with full regex (including analytics).")
+
+if 'proxy_buffering off;' not in content and 'proxy_pass http://127.0.0.1:3001;' in content:
+    content = content.replace(
+        'proxy_pass http://127.0.0.1:3001;',
+        'proxy_pass http://127.0.0.1:3001;\\n        proxy_buffering off;\\n        proxy_cache off;\\n        proxy_read_timeout 300s;'
+    )
+    print("Added SSE / proxy_buffering off settings.")
+
+with open('/etc/nginx/sites-available/kairou', 'w') as f:
+    f.write(content)
+print("Nginx config saved.")
 '''
 with sftp.file('/tmp/update_nginx.py', 'w') as f:
     f.write(nginx_update_py)

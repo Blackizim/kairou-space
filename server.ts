@@ -71,6 +71,61 @@ const EXTRACT_CACHE_TTL_MS = 10 * 60 * 1000;
 const STREAM_REGISTRY_TTL_MS = 4 * 60 * 60 * 1000;
 const META_CACHE_TTL_MS = 15 * 60 * 1000;
 
+const PROXY_TOKEN_SECRET = crypto
+  .createHash('sha256')
+  .update(process.env.PROXY_TOKEN_SECRET || 'kairou-proxy-secret-alexhost-2026')
+  .digest();
+
+function createStatelessProxyToken(
+  url: string,
+  referer: string,
+  extraHeaders?: Record<string, string>,
+  ttlMs = STREAM_REGISTRY_TTL_MS
+): string {
+  try {
+    const payload = JSON.stringify({
+      u: url,
+      r: referer,
+      h: extraHeaders,
+      e: Math.floor((Date.now() + ttlMs) / 1000),
+    });
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', PROXY_TOKEN_SECRET, iv);
+    const enc = Buffer.concat([cipher.update(payload, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return Buffer.concat([iv, tag, enc]).toString('base64url');
+  } catch {
+    return crypto.randomBytes(9).toString('base64url');
+  }
+}
+
+function resolveStatelessProxyToken(token: string): {
+  url: string;
+  referer: string;
+  extraHeaders?: Record<string, string>;
+} | null {
+  try {
+    const buf = Buffer.from(token, 'base64url');
+    if (buf.length < 28) return null;
+    const iv = buf.subarray(0, 12);
+    const tag = buf.subarray(12, 28);
+    const enc = buf.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', PROXY_TOKEN_SECRET, iv);
+    decipher.setAuthTag(tag);
+    const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
+    const obj = JSON.parse(dec.toString('utf8'));
+    if (!obj || typeof obj.u !== 'string') return null;
+    if (typeof obj.e === 'number' && obj.e * 1000 < Date.now()) return null;
+    return {
+      url: obj.u,
+      referer: typeof obj.r === 'string' ? obj.r : '',
+      extraHeaders: obj.h && typeof obj.h === 'object' ? obj.h : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface StoredTarget {
   url: string;
   referer: string;
@@ -157,7 +212,7 @@ function registerProxyToken(
     return existing.token;
   }
   pruneExpiredMaps();
-  const token = crypto.randomBytes(9).toString('base64url');
+  const token = createStatelessProxyToken(url, referer, extraHeaders);
   const expiresAt = now + STREAM_REGISTRY_TTL_MS;
   proxyTokenRegistry.set(token, { url, referer, extraHeaders, expiresAt });
   urlToProxyToken.set(mapKey, { token, expiresAt });
@@ -171,7 +226,8 @@ function registerStream(
   extraHeaders?: Record<string, string>
 ): string {
   pruneExpiredMaps();
-  const id = `s_${crypto.createHash('sha1').update(url).digest('base64url').slice(0, 12)}`;
+  const token = createStatelessProxyToken(url, referer, extraHeaders);
+  const id = `s_${token}`;
   streamRegistry.set(id, {
     url,
     referer,
@@ -3156,38 +3212,51 @@ async function startServer() {
 
   // SSE stream of live anonymized extraction updates
   app.get('/api/extract/stream/:jobId', (req, res) => {
-    const job = activeJobs.get(req.params.jobId);
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Content-Encoding', 'identity');
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
 
+    const job = activeJobs.get(req.params.jobId);
     if (!job) {
       res.write(`data: ${JSON.stringify({ done: true, snapshot: null })}\n\n`);
       res.end();
       return;
     }
 
+    let isClosed = false;
     const sendPayload = (payload: { done: boolean; snapshot: AnonymizedExtractResponse }) => {
-      if (res.writableEnded) return;
+      if (isClosed || res.writableEnded) return;
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
       if (payload.done) {
-        setTimeout(() => {
+        isClosed = true;
+        job.emitter.off('update', listener);
+        setImmediate(() => {
           if (!res.writableEnded) {
             try { res.end(); } catch {}
           }
-        }, 1200);
+        });
       }
+    };
+
+    const listener = (payload: { done: boolean; snapshot: AnonymizedExtractResponse }) => {
+      sendPayload(payload);
     };
 
     // Send latest snapshot immediately
     sendPayload({ done: job.done, snapshot: job.lastSnapshot });
     if (job.done) return;
 
-    const listener = (payload: { done: boolean; snapshot: AnonymizedExtractResponse }) => {
-      sendPayload(payload);
-    };
     job.emitter.on('update', listener);
     req.on('close', () => {
+      isClosed = true;
       job.emitter.off('update', listener);
     });
   });
@@ -3470,7 +3539,22 @@ async function startServer() {
   }
 
   app.get('/api/stream/:id/:file', async (req, res) => {
-    const entry = streamRegistry.get(req.params.id);
+    let entry = streamRegistry.get(req.params.id);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      if (req.params.id.startsWith('s_')) {
+        const resolved = resolveStatelessProxyToken(req.params.id.slice(2));
+        if (resolved) {
+          entry = {
+            url: resolved.url,
+            referer: resolved.referer,
+            extraHeaders: resolved.extraHeaders,
+            format: req.params.file.endsWith('.mp4') ? 'mp4' : 'hls',
+            expiresAt: Date.now() + STREAM_REGISTRY_TTL_MS,
+          };
+          streamRegistry.set(req.params.id, entry);
+        }
+      }
+    }
     if (!entry || entry.expiresAt <= Date.now()) {
       res.status(404).send('Stream expired');
       return;
@@ -3479,7 +3563,19 @@ async function startServer() {
   });
 
   app.get('/api/p/:tok', async (req, res) => {
-    const entry = proxyTokenRegistry.get(req.params.tok);
+    let entry = proxyTokenRegistry.get(req.params.tok);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      const resolved = resolveStatelessProxyToken(req.params.tok);
+      if (resolved) {
+        entry = {
+          url: resolved.url,
+          referer: resolved.referer,
+          extraHeaders: resolved.extraHeaders,
+          expiresAt: Date.now() + STREAM_REGISTRY_TTL_MS,
+        };
+        proxyTokenRegistry.set(req.params.tok, entry);
+      }
+    }
     if (!entry || entry.expiresAt <= Date.now()) {
       res.status(404).send('Token expired');
       return;

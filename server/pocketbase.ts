@@ -143,6 +143,10 @@ export function createPocketBaseRouter() {
 
   // Transparent upstream proxy to live PocketBase (active on VPS with all 850 accounts)
   router.use(async (req, res, next) => {
+    // profile_state is handled by Express local fallback store
+    if (req.url.includes('/collections/profile_state')) {
+      return next();
+    }
     try {
       const targetUrl = `${pbUrl.replace(/\/$/, '')}/api${req.url}`;
       const forwardHeaders: Record<string, string> = {
@@ -162,6 +166,11 @@ export function createPocketBaseRouter() {
         signal: controller.signal,
       });
       clearTimeout(timer);
+
+      // If upstream PocketBase returns 404, fall through to Express fallback store
+      if (upstream.status === 404) {
+        return next();
+      }
 
       res.status(upstream.status);
       upstream.headers.forEach((v, k) => {
