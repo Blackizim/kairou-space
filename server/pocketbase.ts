@@ -87,34 +87,70 @@ const DEFAULT_STORE: LocalStore = {
   ],
 };
 
-function readStore(): LocalStore {
-  try {
-    const file = storeFile();
-    if (!fs.existsSync(file)) {
-      saveStore(DEFAULT_STORE);
-      return JSON.parse(JSON.stringify(DEFAULT_STORE));
+let memoryStore: LocalStore | null = null;
+let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+let isSaving = false;
+
+function scheduleSaveStore() {
+  if (saveTimeout) return;
+  saveTimeout = setTimeout(async () => {
+    saveTimeout = null;
+    if (!memoryStore || isSaving) return;
+    isSaving = true;
+    try {
+      const file = storeFile();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+      const json = JSON.stringify(memoryStore);
+      await fs.promises.writeFile(tmp, json, 'utf8');
+      await fs.promises.rename(tmp, file);
+    } catch (err) {
+      console.error('Failed to save auth store:', err);
+    } finally {
+      isSaving = false;
     }
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return {
-      users: Array.isArray(data.users) && data.users.length ? data.users : DEFAULT_STORE.users,
-      profiles: Array.isArray(data.profiles) && data.profiles.length ? data.profiles : DEFAULT_STORE.profiles,
-      profile_state: Array.isArray(data.profile_state) ? data.profile_state : DEFAULT_STORE.profile_state,
-    };
-  } catch {
-    return JSON.parse(JSON.stringify(DEFAULT_STORE));
-  }
+  }, 5_000);
 }
 
-function saveStore(data: LocalStore) {
+function flushSaveStoreSync() {
+  if (!memoryStore) return;
   try {
     const file = storeFile();
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify(memoryStore), 'utf8');
     fs.renameSync(tmp, file);
-  } catch (err) {
-    console.error('Failed to save auth store:', err);
+  } catch {}
+}
+
+process.on('SIGTERM', () => flushSaveStoreSync());
+process.on('SIGINT', () => flushSaveStoreSync());
+
+function readStore(): LocalStore {
+  if (memoryStore) return memoryStore;
+  try {
+    const file = storeFile();
+    if (!fs.existsSync(file)) {
+      memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE));
+      scheduleSaveStore();
+      return memoryStore;
+    }
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    memoryStore = {
+      users: Array.isArray(data.users) && data.users.length ? data.users : DEFAULT_STORE.users,
+      profiles: Array.isArray(data.profiles) && data.profiles.length ? data.profiles : DEFAULT_STORE.profiles,
+      profile_state: Array.isArray(data.profile_state) ? data.profile_state : DEFAULT_STORE.profile_state,
+    };
+    return memoryStore;
+  } catch {
+    memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE));
+    return memoryStore;
   }
+}
+
+function saveStore(data: LocalStore) {
+  memoryStore = data;
+  scheduleSaveStore();
 }
 
 export function grantUserVip(identity: string, days: number, _plan = 'mensal'): string | null {

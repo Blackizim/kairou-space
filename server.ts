@@ -1937,8 +1937,12 @@ async function verifyStreamsBatch(
   candidates: InternalExtractedStream[]
 ): Promise<InternalExtractedStream[]> {
   if (candidates.length === 0) return [];
+  // Sort candidates by priorityBoost descending and cap to top 6 to prevent runaway concurrent HTTP probes
+  const topCandidates = candidates
+    .sort((a, b) => (b.priorityBoost ?? 0) - (a.priorityBoost ?? 0))
+    .slice(0, 6);
   const results = await Promise.all(
-    candidates.map((c) => verifyStreamCandidate(c))
+    topCandidates.map((c) => verifyStreamCandidate(c))
   );
   return results.filter((x): x is InternalExtractedStream => x !== null);
 }
@@ -3176,6 +3180,14 @@ async function startServer() {
     };
     activeJobs.set(jobId, job);
 
+    const hardSafetyTimer = setTimeout(() => {
+      if (!job.done) {
+        job.done = true;
+        job.emitter.emit('update', { done: true, snapshot: job.lastSnapshot });
+      }
+      activeJobs.delete(jobId);
+    }, 15_000);
+
     let resolveFirstWave: (() => void) | null = null;
     const firstWaveReady = new Promise<void>((resolve) => {
       resolveFirstWave = resolve;
@@ -3211,6 +3223,7 @@ async function startServer() {
       }
       job.emitter.emit('update', { done: false, snapshot: job.lastSnapshot });
     }).finally(() => {
+      clearTimeout(hardSafetyTimer);
       job.done = true;
       job.lastSnapshot = buildAnonymizedSnapshot(
         job.rawStreams,
@@ -3230,7 +3243,7 @@ async function startServer() {
       resolveFirstWave?.();
       resolveFirstWave = null;
       job.emitter.emit('update', { done: true, snapshot: job.lastSnapshot });
-      setTimeout(() => activeJobs.delete(jobId), 45_000);
+      setTimeout(() => activeJobs.delete(jobId), 10_000);
     });
 
     // Race up to 3200ms (or earlier as soon as verified stream arrives) so initial response returns real streams
@@ -3354,18 +3367,6 @@ async function startServer() {
       parsed.kind === 'movie'
         ? `movie:${parsed.tmdbId}`
         : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
-
-    if (!refresh) {
-      const cached = extractCache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now() && cached.value.streams.length > 0) {
-        res.json({
-          jobId: null,
-          done: true,
-          snapshot: { ...cached.value, cached: true, elapsedMs: Date.now() - startedAt },
-        });
-        return;
-      }
-    }
 
     if (!refresh) {
       const hit = extractCache.get(cacheKey);
