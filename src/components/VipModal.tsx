@@ -40,13 +40,18 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
 
   const requestVip = async (action: string, body: object) => {
     const token = getPocketBaseToken();
+    const payload = {
+      ...body,
+      email: account?.email,
+      userId: account?.pbId,
+    };
     const response = await fetch(`/api/vip/${action}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: token } : {}),
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {

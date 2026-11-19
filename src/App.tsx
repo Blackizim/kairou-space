@@ -80,10 +80,12 @@ export default function App() {
 
   // Progressive automatic extraction state
   const [extractState, setExtractState] = useState<{
+    targetKey?: string;
     status: 'idle' | 'loading' | 'ready' | 'error';
     data: AnonymizedExtractResponse | null;
     error?: string;
   }>({ status: 'idle', data: null });
+  const extractTargetKeyRef = useRef<string>('');
   const extractAbortRef = useRef<AbortController | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -463,8 +465,12 @@ export default function App() {
       extractAbortRef.current = controller;
 
       const tmdb = item.tmdbId || '';
+      const targetKey = item.mediaType === 'series' ? `${item.id}-s${s}-e${e}` : `${item.id}`;
+      extractTargetKeyRef.current = targetKey;
+
       if (!tmdb) {
         setExtractState({
+          targetKey,
           status: 'error',
           data: null,
           error: 'Identificador indisponível para este título.',
@@ -475,8 +481,9 @@ export default function App() {
       const target = item.mediaType === 'series' ? `${tmdb}/${s}/${e}` : tmdb;
 
       setExtractState((prev) => ({
+        targetKey,
         status: 'loading',
-        data: refresh ? prev.data : null,
+        data: refresh && prev.targetKey === targetKey ? prev.data : null,
       }));
 
       try {
@@ -505,25 +512,35 @@ export default function App() {
         if (!res.ok) {
           throw new Error(startJson.error || `Erro HTTP ${res.status}`);
         }
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || extractTargetKeyRef.current !== targetKey) return;
 
         if (startJson.done || !startJson.jobId) {
-          setExtractState({
-            status: 'ready',
-            data: applyPreferenceOrder(startJson.snapshot),
-          });
+          if (extractTargetKeyRef.current === targetKey) {
+            setExtractState({
+              targetKey,
+              status: 'ready',
+              data: applyPreferenceOrder(startJson.snapshot),
+            });
+          }
           return;
         }
 
-        setExtractState({
-          status: 'loading',
-          data: applyPreferenceOrder(startJson.snapshot),
-        });
+        if (extractTargetKeyRef.current === targetKey) {
+          setExtractState({
+            targetKey,
+            status: 'loading',
+            data: applyPreferenceOrder(startJson.snapshot),
+          });
+        }
 
         const es = new EventSource(`/api/extract/stream/${encodeURIComponent(startJson.jobId)}`);
         eventSourceRef.current = es;
 
         es.onmessage = (ev) => {
+          if (extractTargetKeyRef.current !== targetKey) {
+            es.close();
+            return;
+          }
           try {
             const payload = JSON.parse(ev.data) as {
               done: boolean;
@@ -531,11 +548,12 @@ export default function App() {
             };
             if (payload.snapshot) {
               setExtractState({
+                targetKey,
                 status: payload.done ? 'ready' : 'loading',
                 data: applyPreferenceOrder(payload.snapshot),
               });
             } else if (payload.done) {
-              setExtractState((curr) => ({ ...curr, status: 'ready' }));
+              setExtractState((curr) => ({ ...curr, targetKey, status: 'ready' }));
             }
             if (payload.done) {
               es.close();
@@ -549,6 +567,7 @@ export default function App() {
         es.onerror = async () => {
           es.close();
           if (eventSourceRef.current === es) eventSourceRef.current = null;
+          if (extractTargetKeyRef.current !== targetKey) return;
           // Fast fallback if SSE closed before streams populated
           try {
             const fallbackRes = await fetch('/api/extract', {
@@ -562,10 +581,11 @@ export default function App() {
                 isAnime: isAnimeHint,
               }),
             });
-            if (fallbackRes.ok) {
+            if (fallbackRes.ok && extractTargetKeyRef.current === targetKey) {
               const fbJson = (await fallbackRes.json()) as AnonymizedExtractResponse;
               if (fbJson.streams?.length) {
                 setExtractState({
+                  targetKey,
                   status: 'ready',
                   data: applyPreferenceOrder(fbJson),
                 });
@@ -575,14 +595,18 @@ export default function App() {
           } catch {
             // ignore
           }
-          setExtractState((curr) => ({
-            ...curr,
-            status: curr.data?.streams?.length ? 'ready' : 'error',
-          }));
+          if (extractTargetKeyRef.current === targetKey) {
+            setExtractState((curr) => ({
+              ...curr,
+              targetKey,
+              status: curr.data?.streams?.length ? 'ready' : 'error',
+            }));
+          }
         };
       } catch (err) {
-        if ((err as Error).name === 'AbortError') return;
+        if ((err as Error).name === 'AbortError' || extractTargetKeyRef.current !== targetKey) return;
         setExtractState({
+          targetKey,
           status: 'error',
           data: null,
           error: err instanceof Error ? err.message : 'Indisponível no momento.',
@@ -594,10 +618,16 @@ export default function App() {
 
   // Open Title Info View (always routes to Info Page first and prepares playback in parallel!)
   const openTitleInfo = useCallback(
-    async (rawItem: MediaTitle, resume = false, pushUrl = true) => {
+    async (
+      rawItem: MediaTitle,
+      resume = false,
+      pushUrl = true,
+      preferredSeason?: number,
+      preferredEpisode?: number
+    ) => {
       const existingProgress = continueWatching.find((c) => c.item.id === rawItem.id);
-      const initSeason = existingProgress?.season ?? rawItem.defaultSeason ?? 1;
-      const initEpisode = existingProgress?.episode ?? rawItem.defaultEpisode ?? 1;
+      const initSeason = preferredSeason ?? existingProgress?.season ?? rawItem.defaultSeason ?? 1;
+      const initEpisode = preferredEpisode ?? existingProgress?.episode ?? rawItem.defaultEpisode ?? 1;
 
       setSelectedTitle(rawItem);
       setSelectedSeason(initSeason);
@@ -612,7 +642,13 @@ export default function App() {
       );
       const typePrefix = isAnime ? 'anime' : (rawItem.mediaType === 'series' ? 'serie' : 'filme');
       const cleanSlug = slugify(rawItem.title);
-      const titlePath = `/${typePrefix}/${rawItem.tmdbId || rawItem.id}${cleanSlug ? '-' + cleanSlug : ''}`;
+      const searchParams = new URLSearchParams(window.location.search);
+      if (rawItem.mediaType === 'series') {
+        searchParams.set('s', String(initSeason));
+        searchParams.set('e', String(initEpisode));
+      }
+      const qs = searchParams.toString() ? `?${searchParams.toString()}` : '';
+      const titlePath = `/${typePrefix}/${rawItem.tmdbId || rawItem.id}${cleanSlug ? '-' + cleanSlug : ''}${qs}`;
       const year = rawItem.year || '';
       let docTitle = `Assistir ${rawItem.title} (${year}) Online Dublado e Legendado HD e 4K — Kairou`;
       if (isAnime) {
@@ -638,11 +674,13 @@ export default function App() {
           const metaJson = (await metaRes.json()) as { item?: MediaTitle };
           if (metaJson.item) {
             const enriched = metaJson.item;
-            setSelectedTitle((curr) =>
-              curr?.id === rawItem.id
-                ? { ...enriched, rankToday: curr.rankToday ?? enriched.rankToday }
-                : curr
-            );
+            setSelectedTitle((curr) => {
+              if (curr?.id !== rawItem.id) return curr;
+              const mergedEpisodes = curr.episodes && curr.episodes.length > (enriched.episodes?.length ?? 0)
+                ? curr.episodes
+                : enriched.episodes;
+              return { ...enriched, episodes: mergedEpisodes, rankToday: curr.rankToday ?? enriched.rankToday };
+            });
             if (!rawItem.tmdbId && enriched.tmdbId) {
               void runAutoExtraction(enriched, initSeason, initEpisode, false);
             }
@@ -665,6 +703,12 @@ export default function App() {
       const match = pathname.match(/^\/(filme|movie|serie|tv|anime)\/([a-zA-Z0-9_:-]+?)(?:-[^/]*)?\/?$/i);
       const hashMatch = (window.location.hash || '').match(/^#\/title\/(movie|tv):([a-zA-Z0-9_:-]+)/i);
 
+      const searchParams = new URLSearchParams(window.location.search);
+      const urlSeason = searchParams.get('s') || searchParams.get('season');
+      const urlEpisode = searchParams.get('e') || searchParams.get('episode');
+      const prefSeason = urlSeason ? Math.max(1, parseInt(urlSeason, 10)) : undefined;
+      const prefEpisode = urlEpisode ? Math.max(1, parseInt(urlEpisode, 10)) : undefined;
+
       if (match || hashMatch) {
         const rawType = match ? match[1] : hashMatch![1];
         const rawId = match ? match[2] : hashMatch![2];
@@ -676,7 +720,7 @@ export default function App() {
               if (!response.ok) continue;
               const data = (await response.json()) as { item?: MediaTitle };
               if (data.item) {
-                void openTitleInfo(data.item, false, false);
+                void openTitleInfo(data.item, false, false, prefSeason, prefEpisode);
                 return;
               }
             } catch {
@@ -717,6 +761,14 @@ export default function App() {
     setPlayerResumeAtSec(0);
     if (!selectedTitle) return;
 
+    try {
+      const searchParams = new URLSearchParams(window.location.search);
+      searchParams.set('s', String(s));
+      searchParams.set('e', String(e));
+      const newUrl = `${window.location.pathname}?${searchParams.toString()}`;
+      window.history.replaceState(null, '', newUrl);
+    } catch {}
+
     void runAutoExtraction(selectedTitle, s, e, false);
     if (autoLaunch) {
       setPlayerStreamIndex(0);
@@ -740,6 +792,19 @@ export default function App() {
               const merged = [...existing.filter((x) => x.season !== s), ...json.episodes!];
               return { ...curr, episodes: merged };
             });
+
+            // If the selected episode is not present in this season (e.g. 1 in One Piece S19 starting at 804), adjust
+            const firstEpNum = json.episodes[0]?.episode;
+            if (firstEpNum && !json.episodes.some((x) => x.episode === e)) {
+              setSelectedEpisode(firstEpNum);
+              void runAutoExtraction(selectedTitle, s, firstEpNum, false);
+              try {
+                const searchParams = new URLSearchParams(window.location.search);
+                searchParams.set('s', String(s));
+                searchParams.set('e', String(firstEpNum));
+                window.history.replaceState(null, '', `${window.location.pathname}?${searchParams.toString()}`);
+              } catch {}
+            }
           }
         }
       } catch {
@@ -787,7 +852,10 @@ export default function App() {
             void runAutoExtraction(selectedTitle, selectedSeason, selectedEpisode, true)
           }
           onLaunchPlayer={(idx = 0) => {
-            if (!extractState.data?.streams?.length) {
+            const currentTargetKey = selectedTitle.mediaType === 'series'
+              ? `${selectedTitle.id}-s${selectedSeason}-e${selectedEpisode}`
+              : `${selectedTitle.id}`;
+            if (extractState.targetKey !== currentTargetKey || !extractState.data?.streams?.length) {
               void runAutoExtraction(selectedTitle, selectedSeason, selectedEpisode, false);
             }
             setPlayerStreamIndex(idx);
@@ -859,9 +927,20 @@ export default function App() {
           item={selectedTitle}
           season={selectedTitle.mediaType === 'series' ? selectedSeason : undefined}
           episode={selectedTitle.mediaType === 'series' ? selectedEpisode : undefined}
-          streams={extractState.data?.streams ?? []}
-          subtitles={extractState.data?.subtitles ?? []}
-          isPreparing={extractState.status === 'loading'}
+          streams={
+            selectedTitle.mediaType !== 'series' || extractState.targetKey === `${selectedTitle.id}-s${selectedSeason}-e${selectedEpisode}`
+              ? (extractState.data?.streams ?? [])
+              : []
+          }
+          subtitles={
+            selectedTitle.mediaType !== 'series' || extractState.targetKey === `${selectedTitle.id}-s${selectedSeason}-e${selectedEpisode}`
+              ? (extractState.data?.subtitles ?? [])
+              : []
+          }
+          isPreparing={
+            extractState.status === 'loading' ||
+            (selectedTitle.mediaType === 'series' && extractState.targetKey !== `${selectedTitle.id}-s${selectedSeason}-e${selectedEpisode}`)
+          }
           initialStreamIndex={playerStreamIndex}
           resumeAtSec={playerResumeAtSec}
           defaultSubtitlesOn={settings.defaultSubtitlesOn}

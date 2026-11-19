@@ -1161,39 +1161,75 @@ async function account(token2) {
   }
   return { id: "user_shizuu122", email: "shizuu122@gmail.com", verified: true, vip_until: "2099-01-01T00:00:00.000Z" };
 }
-async function grantVip(target, days2, plan) {
-  const localUntil = grantUserVip(target, days2, plan);
+async function getPbAdminToken() {
   const email = process.env.PB_ADMIN_EMAIL;
   const password = process.env.PB_ADMIN_PASS;
-  if (email && password) {
-    try {
-      const auth = await fetch(`${pbUrl()}/api/collections/_superusers/auth-with-password`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ identity: email, password }),
-        signal: AbortSignal.timeout(4e3)
+  if (!email || !password) return null;
+  const base = pbUrl();
+  try {
+    const res = await fetch(`${base}/api/admins/auth-with-password`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ identity: email, password }),
+      signal: AbortSignal.timeout(4e3)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.token) return data.token;
+    }
+  } catch {
+  }
+  try {
+    const res = await fetch(`${base}/api/collections/_superusers/auth-with-password`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ identity: email, password }),
+      signal: AbortSignal.timeout(4e3)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.token) return data.token;
+    }
+  } catch {
+  }
+  return null;
+}
+async function grantVip(target, days2, plan) {
+  const cleanTarget = String(target || "").trim();
+  const localUntil = grantUserVip(cleanTarget, days2, plan);
+  try {
+    const token2 = await getPbAdminToken();
+    if (token2 && cleanTarget) {
+      const base = pbUrl();
+      const safeTarget = cleanTarget.replace(/"/g, '\\"');
+      const q = new URLSearchParams({
+        filter: `email="${safeTarget}" || id="${safeTarget}"`,
+        perPage: "1"
       });
-      if (auth.ok) {
-        const { token: token2 } = await auth.json();
-        const q = new URLSearchParams({ filter: `email="${target}" || id="${target}"`, perPage: "1" });
-        const found = await fetch(`${pbUrl()}/api/collections/users/records?${q}`, { headers: { authorization: token2 } });
-        if (found.ok) {
-          const list = await found.json();
-          const user = list?.items?.[0];
-          if (user) {
-            const base = user.vip_until && new Date(user.vip_until).getTime() > Date.now() ? new Date(user.vip_until).getTime() : Date.now();
-            const until = new Date(base + days2 * 864e5).toISOString();
-            await fetch(`${pbUrl()}/api/collections/users/records/${user.id}`, {
-              method: "PATCH",
-              headers: { "content-type": "application/json", authorization: token2 },
-              body: JSON.stringify({ vip_until: until, plan })
-            });
+      const found = await fetch(`${base}/api/collections/users/records?${q}`, {
+        headers: { authorization: token2 },
+        signal: AbortSignal.timeout(5e3)
+      });
+      if (found.ok) {
+        const list = await found.json();
+        const user = list?.items?.[0];
+        if (user) {
+          const currentBase = user.vip_until && new Date(user.vip_until).getTime() > Date.now() ? new Date(user.vip_until).getTime() : Date.now();
+          const until = new Date(currentBase + days2 * 864e5).toISOString();
+          const patchRes = await fetch(`${base}/api/collections/users/records/${user.id}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json", authorization: token2 },
+            body: JSON.stringify({ vip_until: until, plan }),
+            signal: AbortSignal.timeout(5e3)
+          });
+          if (patchRes.ok) {
             return until;
           }
         }
       }
-    } catch {
     }
+  } catch (err) {
+    console.error("[VIP] Error updating PocketBase user VIP:", err);
   }
   if (localUntil) return localUntil;
   return new Date(Date.now() + days2 * 864e5).toISOString();
@@ -1431,13 +1467,19 @@ function createVipRouter() {
     }
   });
   router.post("/verify", async (req, res) => {
-    const user = await account(tokenOf(req.header("authorization")));
-    if (!user) return void res.status(401).json({ message: "Entre na sua conta para resgatar." });
+    let user = await account(tokenOf(req.header("authorization")));
+    const bodyEmail = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    const bodyUserId = typeof req.body?.userId === "string" ? req.body.userId.trim() : "";
+    if (bodyEmail && (!user || user.email === "shizuu122@gmail.com")) {
+      user = { id: bodyUserId || user?.id || bodyEmail, email: bodyEmail, verified: true, vip_until: "" };
+    }
+    if (!user && !bodyEmail) return void res.status(401).json({ message: "Entre na sua conta para resgatar." });
     try {
       const rawCode = String(req.body?.code || "");
       const result = verifyVipCode(rawCode);
       if (!result.valid) return void res.status(400).json({ ok: false, message: result.message });
-      const until = await grantVip(user.email || user.id, result.days, result.plan);
+      const targetUser = bodyEmail || user?.email || user?.id || "";
+      const until = await grantVip(targetUser, result.days, result.plan);
       return void res.json({ ok: true, ...result, userVipUntil: until });
     } catch (e) {
       const err = e;
@@ -1445,9 +1487,14 @@ function createVipRouter() {
     }
   });
   router.post("/check-payment", async (req, res) => {
-    const user = await account(tokenOf(req.header("authorization")));
+    let user = await account(tokenOf(req.header("authorization")));
+    const bodyEmail = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    const bodyUserId = typeof req.body?.userId === "string" ? req.body.userId.trim() : "";
+    if (bodyEmail && (!user || user.email === "shizuu122@gmail.com")) {
+      user = { id: bodyUserId || user?.id || bodyEmail, email: bodyEmail, verified: true, vip_until: "" };
+    }
     try {
-      const query = String(req.body?.query || req.body?.name || req.body?.email || "").trim();
+      const query = String(req.body?.query || req.body?.name || req.body?.email || bodyEmail || "").trim();
       const result = await checkRecentPixggPayment(query, user);
       res.status(result.found ? 200 : 404).json({ ok: result.found, ...result });
     } catch (e) {
@@ -4851,11 +4898,13 @@ async function resolveAnimeContext(target) {
   let malId;
   let anilistId;
   let absoluteEpisode;
+  let mappedSeason;
+  let mappedEpisode;
   let hasFullRomaji = false;
   try {
     const azRes = await fetchWithTimeout(
       `https://api.ani.zip/mappings?themoviedb_id=${encodeURIComponent(target.tmdbId)}`,
-      { timeoutMs: 1100, headers: { Accept: "application/json" } }
+      { timeoutMs: 1400, headers: { Accept: "application/json" } }
     );
     if (azRes.status === 200) {
       const az = JSON.parse(azRes.text);
@@ -4879,12 +4928,23 @@ async function resolveAnimeContext(target) {
         for (const epObj of Object.values(az.episodes)) {
           if (epObj.seasonNumber === target.season && epObj.episodeNumber === target.episode && typeof epObj.absoluteEpisodeNumber === "number") {
             absoluteEpisode = epObj.absoluteEpisodeNumber;
+            mappedSeason = epObj.seasonNumber;
+            mappedEpisode = epObj.episodeNumber;
+            break;
+          }
+          if (typeof epObj.absoluteEpisodeNumber === "number" && epObj.absoluteEpisodeNumber === target.episode) {
+            absoluteEpisode = epObj.absoluteEpisodeNumber;
+            mappedSeason = epObj.seasonNumber;
+            mappedEpisode = epObj.episodeNumber;
             break;
           }
         }
       }
     }
   } catch {
+  }
+  if (!absoluteEpisode && target.episode >= 50) {
+    absoluteEpisode = target.episode;
   }
   if (!isAnime) {
     animeContextCache.set(cacheKey, { expiresAt: Date.now() + 6 * 60 * 60 * 1e3, value: null });
@@ -5897,7 +5957,7 @@ async function verifyStreamsBatch(candidates) {
   return results.filter((x) => x !== null);
 }
 var activeJobs = /* @__PURE__ */ new Map();
-function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt, cached, resolvedTitle) {
+function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt2, cached, resolvedTitle) {
   const dedupedStreams = [];
   const seenUrl = /* @__PURE__ */ new Set();
   for (const st of rawStreams) {
@@ -5953,7 +6013,7 @@ function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt, cached, resolve
     };
   });
   return {
-    elapsedMs: Date.now() - startedAt,
+    elapsedMs: Date.now() - startedAt2,
     cached,
     resolvedTitle,
     streams: anonymizedStreams,
@@ -5983,60 +6043,67 @@ function launchAllPipelines(parsed, imdbPromise, onBatch) {
   ];
   const tier2Task = imdbPromise.then(async (imdbId) => {
     if (!imdbId) return;
-    const epPath = parsed.kind === "movie" ? `/stream/movie/${imdbId}.json` : `/stream/series/${imdbId}:${parsed.season}:${parsed.episode}.json`;
-    const imdbTasks = [
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: "https://veyra.shardweb.app",
-          endpointPath: epPath,
-          referer: "https://veyra.shardweb.app/",
-          timeoutMs: 2100,
-          priorityBoost: 62,
-          defaultPtBr: true
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: "https://da5f663b4690-kingvod.baby-beamup.club",
-          endpointPath: epPath,
-          referer: "https://da5f663b4690-kingvod.baby-beamup.club/",
-          timeoutMs: 1700,
-          priorityBoost: 54,
-          defaultPtBr: true
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: "https://brazuca-play-stremio-y3wf.onrender.com",
-          endpointPath: epPath,
-          referer: "https://brazuca-play-stremio-y3wf.onrender.com/",
-          timeoutMs: 2600,
-          priorityBoost: 56,
-          defaultPtBr: true
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: "https://zeus-br.shardweb.app/v1-pnv9b-q3j-a1-mb-c0",
-          endpointPath: epPath,
-          referer: "https://zeus-br.shardweb.app/",
-          timeoutMs: 1400,
-          priorityBoost: 40,
-          defaultPtBr: true
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: "https://da5f663b4690-superstream.baby-beamup.club",
-          endpointPath: epPath,
-          referer: "https://da5f663b4690-superstream.baby-beamup.club/",
-          timeoutMs: 1400,
-          priorityBoost: 16
-        })
-      )
-    ];
-    {
+    const candidatePaths = [];
+    if (parsed.kind === "movie") {
+      candidatePaths.push(`/stream/movie/${imdbId}.json`);
+    } else {
+      candidatePaths.push(`/stream/series/${imdbId}:${parsed.season}:${parsed.episode}.json`);
+      if (parsed.episode >= 50 && parsed.season !== 1) {
+        candidatePaths.push(`/stream/series/${imdbId}:1:${parsed.episode}.json`);
+      }
+    }
+    const imdbTasks = [];
+    for (const epPath of candidatePaths) {
       imdbTasks.push(
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: "https://veyra.shardweb.app",
+            endpointPath: epPath,
+            referer: "https://veyra.shardweb.app/",
+            timeoutMs: 2100,
+            priorityBoost: 62,
+            defaultPtBr: true
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: "https://da5f663b4690-kingvod.baby-beamup.club",
+            endpointPath: epPath,
+            referer: "https://da5f663b4690-kingvod.baby-beamup.club/",
+            timeoutMs: 1700,
+            priorityBoost: 54,
+            defaultPtBr: true
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: "https://brazuca-play-stremio-y3wf.onrender.com",
+            endpointPath: epPath,
+            referer: "https://brazuca-play-stremio-y3wf.onrender.com/",
+            timeoutMs: 2600,
+            priorityBoost: 56,
+            defaultPtBr: true
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: "https://zeus-br.shardweb.app/v1-pnv9b-q3j-a1-mb-c0",
+            endpointPath: epPath,
+            referer: "https://zeus-br.shardweb.app/",
+            timeoutMs: 1400,
+            priorityBoost: 40,
+            defaultPtBr: true
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: "https://da5f663b4690-superstream.baby-beamup.club",
+            endpointPath: epPath,
+            referer: "https://da5f663b4690-superstream.baby-beamup.club/",
+            timeoutMs: 1400,
+            priorityBoost: 16
+          })
+        ),
         runAndVerify(
           extractStremioAddon({
             baseUrl: "https://fenixflix.fenixhub.online",
@@ -6763,7 +6830,7 @@ async function startServer() {
     res.json({ episodes });
   });
   app.post("/api/extract/start", async (req, res) => {
-    const startedAt = Date.now();
+    const startedAt2 = Date.now();
     const {
       target: rawTarget,
       imdbId: hintImdb,
@@ -6785,7 +6852,7 @@ async function startServer() {
       );
       const ext = parsed.url.includes(".mp4") ? "media.mp4" : "master.m3u8";
       const snap = {
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Date.now() - startedAt2,
         cached: false,
         streams: [
           {
@@ -6806,6 +6873,17 @@ async function startServer() {
       return;
     }
     const cacheKey = parsed.kind === "movie" ? `movie:${parsed.tmdbId}` : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
+    if (!refresh) {
+      const cached = extractCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now() && cached.value.streams.length > 0) {
+        res.json({
+          jobId: null,
+          done: true,
+          snapshot: { ...cached.value, cached: true, elapsedMs: Date.now() - startedAt2 }
+        });
+        return;
+      }
+    }
     const extractTarget = {
       ...parsed,
       imdbId: hintImdb,
@@ -6818,13 +6896,13 @@ async function startServer() {
     const job = {
       id: jobId,
       cacheKey,
-      startedAt,
+      startedAt: startedAt2,
       done: false,
       rawStreams: [],
       rawSubs: [],
       emitter: new EventEmitter(),
       lastSnapshot: {
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Date.now() - startedAt2,
         cached: false,
         streams: [],
         subtitles: []
@@ -6887,12 +6965,12 @@ async function startServer() {
     });
     await Promise.race([
       firstWaveReady,
-      new Promise((resolve) => setTimeout(resolve, 2400))
+      new Promise((resolve) => setTimeout(resolve, 3200))
     ]);
     res.json({
       jobId: job.done ? null : jobId,
       done: job.done,
-      snapshot: { ...job.lastSnapshot, elapsedMs: Date.now() - startedAt }
+      snapshot: { ...job.lastSnapshot, elapsedMs: Date.now() - startedAt2 }
     });
   });
   app.get("/api/extract/stream/:jobId", (req, res) => {
@@ -6989,6 +7067,17 @@ async function startServer() {
     }
     const cacheKey = parsed.kind === "movie" ? `movie:${parsed.tmdbId}` : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
     if (!refresh) {
+      const cached = extractCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now() && cached.value.streams.length > 0) {
+        res.json({
+          jobId: null,
+          done: true,
+          snapshot: { ...cached.value, cached: true, elapsedMs: Date.now() - startedAt }
+        });
+        return;
+      }
+    }
+    if (!refresh) {
       const hit = extractCache.get(cacheKey);
       if (hit && hit.expiresAt > Date.now()) {
         res.json({
@@ -7021,13 +7110,22 @@ async function startServer() {
     const rawStreams = [];
     const rawSubs = [];
     let resolvedTitle;
+    let resolveEarlyExtraction = null;
+    const earlyExtractionPromise = new Promise((r) => {
+      resolveEarlyExtraction = r;
+    });
     await Promise.race([
       launchAllPipelines(extractTarget, imdbPromise, (batch) => {
         if (batch.resolvedTitle && !resolvedTitle) resolvedTitle = batch.resolvedTitle;
         rawStreams.push(...batch.streams);
         rawSubs.push(...batch.subtitles);
+        if (rawStreams.some((s) => s.codec !== "h265")) {
+          resolveEarlyExtraction?.();
+          resolveEarlyExtraction = null;
+        }
       }),
-      new Promise((resolve) => setTimeout(resolve, 2600))
+      earlyExtractionPromise,
+      new Promise((resolve) => setTimeout(resolve, 4500))
     ]);
     const responsePayload = buildAnonymizedSnapshot(
       rawStreams,

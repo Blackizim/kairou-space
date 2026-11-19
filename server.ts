@@ -487,6 +487,8 @@ interface AnimeContext {
   imdbId?: string;
   malId?: number;
   absoluteEpisode?: number;
+  mappedSeason?: number;
+  mappedEpisode?: number;
 }
 
 async function resolveAnimeContext(target: ExtractTarget): Promise<AnimeContext | null> {
@@ -531,12 +533,14 @@ async function resolveAnimeContext(target: ExtractTarget): Promise<AnimeContext 
   let malId: number | undefined;
   let anilistId: number | undefined;
   let absoluteEpisode: number | undefined;
+  let mappedSeason: number | undefined;
+  let mappedEpisode: number | undefined;
 
   let hasFullRomaji = false;
   try {
     const azRes = await fetchWithTimeout(
       `https://api.ani.zip/mappings?themoviedb_id=${encodeURIComponent(target.tmdbId)}`,
-      { timeoutMs: 1100, headers: { Accept: 'application/json' } }
+      { timeoutMs: 1400, headers: { Accept: 'application/json' } }
     );
     if (azRes.status === 200) {
       const az = JSON.parse(azRes.text) as {
@@ -566,12 +570,25 @@ async function resolveAnimeContext(target: ExtractTarget): Promise<AnimeContext 
 
       if (az.episodes) {
         for (const epObj of Object.values(az.episodes)) {
+          // Exact season & episode match
           if (
             epObj.seasonNumber === target.season &&
             epObj.episodeNumber === target.episode &&
             typeof epObj.absoluteEpisodeNumber === 'number'
           ) {
             absoluteEpisode = epObj.absoluteEpisodeNumber;
+            mappedSeason = epObj.seasonNumber;
+            mappedEpisode = epObj.episodeNumber;
+            break;
+          }
+          // Target episode matches absolute episode (e.g. One Piece ep 818)
+          if (
+            typeof epObj.absoluteEpisodeNumber === 'number' &&
+            epObj.absoluteEpisodeNumber === target.episode
+          ) {
+            absoluteEpisode = epObj.absoluteEpisodeNumber;
+            mappedSeason = epObj.seasonNumber;
+            mappedEpisode = epObj.episodeNumber;
             break;
           }
         }
@@ -579,6 +596,10 @@ async function resolveAnimeContext(target: ExtractTarget): Promise<AnimeContext 
     }
   } catch {
     // ignore ani.zip timeout
+  }
+
+  if (!absoluteEpisode && target.episode >= 50) {
+    absoluteEpisode = target.episode;
   }
 
   if (!isAnime) {
@@ -2059,65 +2080,68 @@ function launchAllPipelines(
   // Launch IMDb-based Stremio pipelines the instant imdbPromise resolves (~0-180ms)
   const tier2Task = imdbPromise.then(async (imdbId) => {
     if (!imdbId) return;
-    const epPath =
-      parsed.kind === 'movie'
-        ? `/stream/movie/${imdbId}.json`
-        : `/stream/series/${imdbId}:${parsed.season}:${parsed.episode}.json`;
+    const candidatePaths: string[] = [];
+    if (parsed.kind === 'movie') {
+      candidatePaths.push(`/stream/movie/${imdbId}.json`);
+    } else {
+      candidatePaths.push(`/stream/series/${imdbId}:${parsed.season}:${parsed.episode}.json`);
+      if (parsed.episode >= 50 && parsed.season !== 1) {
+        candidatePaths.push(`/stream/series/${imdbId}:1:${parsed.episode}.json`);
+      }
+    }
 
-    const imdbTasks: Array<Promise<void>> = [
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://veyra.shardweb.app',
-          endpointPath: epPath,
-          referer: 'https://veyra.shardweb.app/',
-          timeoutMs: 2100,
-          priorityBoost: 62,
-          defaultPtBr: true,
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://da5f663b4690-kingvod.baby-beamup.club',
-          endpointPath: epPath,
-          referer: 'https://da5f663b4690-kingvod.baby-beamup.club/',
-          timeoutMs: 1700,
-          priorityBoost: 54,
-          defaultPtBr: true,
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://brazuca-play-stremio-y3wf.onrender.com',
-          endpointPath: epPath,
-          referer: 'https://brazuca-play-stremio-y3wf.onrender.com/',
-          timeoutMs: 2600,
-          priorityBoost: 56,
-          defaultPtBr: true,
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://zeus-br.shardweb.app/v1-pnv9b-q3j-a1-mb-c0',
-          endpointPath: epPath,
-          referer: 'https://zeus-br.shardweb.app/',
-          timeoutMs: 1400,
-          priorityBoost: 40,
-          defaultPtBr: true,
-        })
-      ),
-      runAndVerify(
-        extractStremioAddon({
-          baseUrl: 'https://da5f663b4690-superstream.baby-beamup.club',
-          endpointPath: epPath,
-          referer: 'https://da5f663b4690-superstream.baby-beamup.club/',
-          timeoutMs: 1400,
-          priorityBoost: 16,
-        })
-      ),
-    ];
-
-    {
+    const imdbTasks: Array<Promise<void>> = [];
+    for (const epPath of candidatePaths) {
       imdbTasks.push(
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: 'https://veyra.shardweb.app',
+            endpointPath: epPath,
+            referer: 'https://veyra.shardweb.app/',
+            timeoutMs: 2100,
+            priorityBoost: 62,
+            defaultPtBr: true,
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: 'https://da5f663b4690-kingvod.baby-beamup.club',
+            endpointPath: epPath,
+            referer: 'https://da5f663b4690-kingvod.baby-beamup.club/',
+            timeoutMs: 1700,
+            priorityBoost: 54,
+            defaultPtBr: true,
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: 'https://brazuca-play-stremio-y3wf.onrender.com',
+            endpointPath: epPath,
+            referer: 'https://brazuca-play-stremio-y3wf.onrender.com/',
+            timeoutMs: 2600,
+            priorityBoost: 56,
+            defaultPtBr: true,
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: 'https://zeus-br.shardweb.app/v1-pnv9b-q3j-a1-mb-c0',
+            endpointPath: epPath,
+            referer: 'https://zeus-br.shardweb.app/',
+            timeoutMs: 1400,
+            priorityBoost: 40,
+            defaultPtBr: true,
+          })
+        ),
+        runAndVerify(
+          extractStremioAddon({
+            baseUrl: 'https://da5f663b4690-superstream.baby-beamup.club',
+            endpointPath: epPath,
+            referer: 'https://da5f663b4690-superstream.baby-beamup.club/',
+            timeoutMs: 1400,
+            priorityBoost: 16,
+          })
+        ),
         runAndVerify(
           extractStremioAddon({
             baseUrl: 'https://fenixflix.fenixhub.online',
@@ -3113,6 +3137,18 @@ async function startServer() {
         ? `movie:${parsed.tmdbId}`
         : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
 
+    if (!refresh) {
+      const cached = extractCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now() && cached.value.streams.length > 0) {
+        res.json({
+          jobId: null,
+          done: true,
+          snapshot: { ...cached.value, cached: true, elapsedMs: Date.now() - startedAt },
+        });
+        return;
+      }
+    }
+
     const extractTarget: ExtractTarget = {
       ...parsed,
       imdbId: hintImdb,
@@ -3197,10 +3233,10 @@ async function startServer() {
       setTimeout(() => activeJobs.delete(jobId), 45_000);
     });
 
-    // Race up to 2400ms (or earlier as soon as verified stream arrives) so initial response returns real streams
+    // Race up to 3200ms (or earlier as soon as verified stream arrives) so initial response returns real streams
     await Promise.race([
       firstWaveReady,
-      new Promise<void>((resolve) => setTimeout(resolve, 2400)),
+      new Promise<void>((resolve) => setTimeout(resolve, 3200)),
     ]);
 
     res.json({
@@ -3320,6 +3356,18 @@ async function startServer() {
         : `tv:${parsed.tmdbId}:${parsed.season}:${parsed.episode}`;
 
     if (!refresh) {
+      const cached = extractCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now() && cached.value.streams.length > 0) {
+        res.json({
+          jobId: null,
+          done: true,
+          snapshot: { ...cached.value, cached: true, elapsedMs: Date.now() - startedAt },
+        });
+        return;
+      }
+    }
+
+    if (!refresh) {
       const hit = extractCache.get(cacheKey);
       if (hit && hit.expiresAt > Date.now()) {
         res.json({
@@ -3356,13 +3404,23 @@ async function startServer() {
     const rawSubs: InternalSubtitle[] = [];
     let resolvedTitle: string | undefined;
 
+    let resolveEarlyExtraction: (() => void) | null = null;
+    const earlyExtractionPromise = new Promise<void>((r) => {
+      resolveEarlyExtraction = r;
+    });
+
     await Promise.race([
       launchAllPipelines(extractTarget, imdbPromise, (batch) => {
         if (batch.resolvedTitle && !resolvedTitle) resolvedTitle = batch.resolvedTitle;
         rawStreams.push(...batch.streams);
         rawSubs.push(...batch.subtitles);
+        if (rawStreams.some((s) => s.codec !== 'h265')) {
+          resolveEarlyExtraction?.();
+          resolveEarlyExtraction = null;
+        }
       }),
-      new Promise<void>((resolve) => setTimeout(resolve, 2600)),
+      earlyExtractionPromise,
+      new Promise<void>((resolve) => setTimeout(resolve, 4500)),
     ]);
 
     const responsePayload = buildAnonymizedSnapshot(

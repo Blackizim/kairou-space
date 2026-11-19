@@ -199,41 +199,85 @@ async function account(token: string | undefined) {
   return { id: 'user_shizuu122', email: 'shizuu122@gmail.com', verified: true, vip_until: '2099-01-01T00:00:00.000Z' };
 }
 
-async function grantVip(target: string, days: number, plan: string): Promise<string> {
-  // 1. Direct update to local auth store
-  const localUntil = grantUserVip(target, days, plan);
-
-  // 2. Also try external PocketBase if configured
+async function getPbAdminToken(): Promise<string | null> {
   const email = process.env.PB_ADMIN_EMAIL;
   const password = process.env.PB_ADMIN_PASS;
-  if (email && password) {
-    try {
-      const auth = await fetch(`${pbUrl()}/api/collections/_superusers/auth-with-password`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ identity: email, password }),
-        signal: AbortSignal.timeout(4000),
+  if (!email || !password) return null;
+  const base = pbUrl();
+
+  // Try /api/admins/auth-with-password (PB v0.22 and earlier)
+  try {
+    const res = await fetch(`${base}/api/admins/auth-with-password`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ identity: email, password }),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { token?: string };
+      if (data.token) return data.token;
+    }
+  } catch {}
+
+  // Fallback: /api/collections/_superusers/auth-with-password (PB v0.23+)
+  try {
+    const res = await fetch(`${base}/api/collections/_superusers/auth-with-password`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ identity: email, password }),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { token?: string };
+      if (data.token) return data.token;
+    }
+  } catch {}
+
+  return null;
+}
+
+async function grantVip(target: string, days: number, plan: string): Promise<string> {
+  const cleanTarget = String(target || '').trim();
+  // 1. Direct update to local auth store
+  const localUntil = grantUserVip(cleanTarget, days, plan);
+
+  // 2. Also try external PocketBase if configured
+  try {
+    const token = await getPbAdminToken();
+    if (token && cleanTarget) {
+      const base = pbUrl();
+      const safeTarget = cleanTarget.replace(/"/g, '\\"');
+      const q = new URLSearchParams({
+        filter: `email="${safeTarget}" || id="${safeTarget}"`,
+        perPage: '1',
       });
-      if (auth.ok) {
-        const { token } = await auth.json() as { token: string };
-        const q = new URLSearchParams({ filter: `email="${target}" || id="${target}"`, perPage: '1' });
-        const found = await fetch(`${pbUrl()}/api/collections/users/records?${q}`, { headers: { authorization: token } });
-        if (found.ok) {
-          const list = await found.json();
-          const user = list?.items?.[0];
-          if (user) {
-            const base = user.vip_until && new Date(user.vip_until).getTime() > Date.now() ? new Date(user.vip_until).getTime() : Date.now();
-            const until = new Date(base + days * 86400000).toISOString();
-            await fetch(`${pbUrl()}/api/collections/users/records/${user.id}`, {
-              method: 'PATCH',
-              headers: { 'content-type': 'application/json', authorization: token },
-              body: JSON.stringify({ vip_until: until, plan })
-            });
+      const found = await fetch(`${base}/api/collections/users/records?${q}`, {
+        headers: { authorization: token },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (found.ok) {
+        const list = (await found.json()) as { items?: Array<{ id: string; vip_until?: string }> };
+        const user = list?.items?.[0];
+        if (user) {
+          const currentBase =
+            user.vip_until && new Date(user.vip_until).getTime() > Date.now()
+              ? new Date(user.vip_until).getTime()
+              : Date.now();
+          const until = new Date(currentBase + days * 86400000).toISOString();
+          const patchRes = await fetch(`${base}/api/collections/users/records/${user.id}`, {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json', authorization: token },
+            body: JSON.stringify({ vip_until: until, plan }),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (patchRes.ok) {
             return until;
           }
         }
       }
-    } catch {}
+    }
+  } catch (err) {
+    console.error('[VIP] Error updating PocketBase user VIP:', err);
   }
 
   if (localUntil) return localUntil;
@@ -531,13 +575,19 @@ export function createVipRouter() {
 
   // Verify VIP Code
   router.post('/verify', async (req, res) => {
-    const user = await account(tokenOf(req.header('authorization')));
-    if (!user) return void res.status(401).json({ message: 'Entre na sua conta para resgatar.' });
+    let user = await account(tokenOf(req.header('authorization')));
+    const bodyEmail = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+    const bodyUserId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+    if (bodyEmail && (!user || user.email === 'shizuu122@gmail.com')) {
+      user = { id: bodyUserId || user?.id || bodyEmail, email: bodyEmail, verified: true, vip_until: '' };
+    }
+    if (!user && !bodyEmail) return void res.status(401).json({ message: 'Entre na sua conta para resgatar.' });
     try {
       const rawCode = String(req.body?.code || '');
       const result = verifyVipCode(rawCode);
       if (!result.valid) return void res.status(400).json({ ok: false, message: result.message });
-      const until = await grantVip(user.email || user.id, result.days, result.plan);
+      const targetUser = bodyEmail || user?.email || user?.id || '';
+      const until = await grantVip(targetUser, result.days, result.plan);
       return void res.json({ ok: true, ...result, userVipUntil: until });
     } catch (e) {
       const err = e as Error & { status?: number };
@@ -547,9 +597,14 @@ export function createVipRouter() {
 
   // Check recent payment
   router.post('/check-payment', async (req, res) => {
-    const user = await account(tokenOf(req.header('authorization')));
+    let user = await account(tokenOf(req.header('authorization')));
+    const bodyEmail = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+    const bodyUserId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+    if (bodyEmail && (!user || user.email === 'shizuu122@gmail.com')) {
+      user = { id: bodyUserId || user?.id || bodyEmail, email: bodyEmail, verified: true, vip_until: '' };
+    }
     try {
-      const query = String(req.body?.query || req.body?.name || req.body?.email || '').trim();
+      const query = String(req.body?.query || req.body?.name || req.body?.email || bodyEmail || '').trim();
       const result = await checkRecentPixggPayment(query, user);
       res.status(result.found ? 200 : 404).json({ ok: result.found, ...result });
     } catch (e) {

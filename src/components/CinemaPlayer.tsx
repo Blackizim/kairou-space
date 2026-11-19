@@ -190,6 +190,19 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       const is1080 = (s: AnonymizedStream) => /1080p|full\s*hd/i.test(s.quality);
       const idx =
         (() => {
+          if (preferPtBr) {
+            const pt1080 = findIdx(
+              (s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality) && s.isPtBr && is1080(s)
+            );
+            if (pt1080 !== -1) return pt1080;
+            const ptHls = findIdx(
+              (s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality) && s.isPtBr && s.format === 'hls'
+            );
+            if (ptHls !== -1) return ptHls;
+            const ptAny = findIdx((s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality) && s.isPtBr);
+            if (ptAny !== -1) return ptAny;
+          }
+
           const a = findIdx((s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality) && is1080(s));
           if (a !== -1) return a;
           const b = findIdx(
@@ -208,7 +221,7 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       if (idx === -1) return null;
       return { stream: candidateList[idx], idx };
     },
-    [isStreamBrowserCompatible]
+    [isStreamBrowserCompatible, preferPtBr]
   );
 
   const pickInitialStream = useCallback((): { stream: AnonymizedStream | null; idx: number } => {
