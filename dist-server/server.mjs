@@ -1175,9 +1175,9 @@ function extractPayment(payload = {}) {
 }
 var pbUrl = () => (process.env.PB_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
 async function account(token2) {
-  if (!token2) return { id: "user_shizuu122", email: "shizuu122@gmail.com", verified: true, vip_until: "2099-01-01T00:00:00.000Z" };
+  if (!token2) return null;
   const clean = token2.replace(/^Bearer\s+/i, "").trim();
-  if (clean === "kairou_token_user_shizuu122" || clean === "kairou_token_shizuu122" || clean.startsWith("kairou_token_")) {
+  if (clean === "kairou_token_user_shizuu122" || clean === "kairou_token_shizuu122") {
     return { id: "user_shizuu122", email: "shizuu122@gmail.com", verified: true, vip_until: "2099-01-01T00:00:00.000Z" };
   }
   try {
@@ -1192,7 +1192,7 @@ async function account(token2) {
     }
   } catch {
   }
-  return { id: "user_shizuu122", email: "shizuu122@gmail.com", verified: true, vip_until: "2099-01-01T00:00:00.000Z" };
+  return null;
 }
 async function getPbAdminToken() {
   const email = process.env.PB_ADMIN_EMAIL;
@@ -1229,14 +1229,17 @@ async function getPbAdminToken() {
 }
 async function grantVip(target, days2, plan) {
   const cleanTarget = String(target || "").trim();
+  if (!cleanTarget) return new Date(Date.now() + days2 * 864e5).toISOString();
   const localUntil = grantUserVip(cleanTarget, days2, plan);
+  let pbUntil = null;
   try {
     const token2 = await getPbAdminToken();
     if (token2 && cleanTarget) {
       const base = pbUrl();
       const safeTarget = cleanTarget.replace(/"/g, '\\"');
+      const safeTargetLower = cleanTarget.toLowerCase().replace(/"/g, '\\"');
       const q = new URLSearchParams({
-        filter: `email="${safeTarget}" || id="${safeTarget}"`,
+        filter: `email="${safeTargetLower}" || email="${safeTarget}" || id="${safeTarget}"`,
         perPage: "1"
       });
       const found = await fetch(`${base}/api/collections/users/records?${q}`, {
@@ -1247,7 +1250,9 @@ async function grantVip(target, days2, plan) {
         const list = await found.json();
         const user = list?.items?.[0];
         if (user) {
-          const currentBase = user.vip_until && new Date(user.vip_until).getTime() > Date.now() ? new Date(user.vip_until).getTime() : Date.now();
+          const rawUntil = (user.vip_until || "").replace(" ", "T");
+          const parsedTime = rawUntil ? Date.parse(rawUntil) : NaN;
+          const currentBase = Number.isFinite(parsedTime) && parsedTime > Date.now() ? parsedTime : Date.now();
           const until = new Date(currentBase + days2 * 864e5).toISOString();
           const patchRes = await fetch(`${base}/api/collections/users/records/${user.id}`, {
             method: "PATCH",
@@ -1256,7 +1261,7 @@ async function grantVip(target, days2, plan) {
             signal: AbortSignal.timeout(5e3)
           });
           if (patchRes.ok) {
-            return until;
+            pbUntil = until;
           }
         }
       }
@@ -1264,6 +1269,19 @@ async function grantVip(target, days2, plan) {
   } catch (err) {
     console.error("[VIP] Error updating PocketBase user VIP:", err);
   }
+  if (!pbUntil && fs3.existsSync("/opt/pocketbase/pb_data/data.db")) {
+    try {
+      const { execSync } = await import("node:child_process");
+      const until = new Date(Date.now() + days2 * 864e5).toISOString();
+      const safeLower = cleanTarget.toLowerCase().replace(/'/g, "");
+      const pyCmd = `python3 -c "import sqlite3; con = sqlite3.connect('/opt/pocketbase/pb_data/data.db'); cur = con.cursor(); cur.execute('UPDATE users SET vip_until = ?, plan = ? WHERE LOWER(email) = ? OR id = ?;', ('${until}', '${plan}', '${safeLower}', '${safeLower}')); con.commit()"`;
+      execSync(pyCmd, { timeout: 3e3 });
+      pbUntil = until;
+    } catch (e) {
+      console.error("[VIP] Direct SQLite update fallback error:", e);
+    }
+  }
+  if (pbUntil) return pbUntil;
   if (localUntil) return localUntil;
   return new Date(Date.now() + days2 * 864e5).toISOString();
 }
@@ -1401,8 +1419,41 @@ async function checkRecentPixggPayment(query = "", user = null) {
       codeItem.redeemedAt = match.redeemedAt;
     }
     let userVipUntil = null;
-    const targetUser = user?.email || match.email;
+    let targetUser = user?.email && user.email !== "shizuu122@gmail.com" ? user.email : match.email;
+    if (!targetUser && match.message && match.message.includes("@")) {
+      const emailMatch = match.message.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/);
+      if (emailMatch) {
+        targetUser = emailMatch[0].trim().toLowerCase();
+      }
+    }
+    if (!targetUser && q.includes("@")) {
+      targetUser = q.trim().toLowerCase();
+    }
+    if (!targetUser && match.senderName) {
+      const sName = match.senderName.trim().toLowerCase();
+      try {
+        const token2 = await getPbAdminToken();
+        if (token2) {
+          const qFind = new URLSearchParams({
+            filter: `email ~ "${sName}"`,
+            perPage: "1"
+          });
+          const fRes = await fetch(`${pbUrl()}/api/collections/users/records?${qFind}`, {
+            headers: { authorization: token2 },
+            signal: AbortSignal.timeout(3e3)
+          });
+          if (fRes.ok) {
+            const fData = await fRes.json();
+            if (fData.items?.[0]?.email) {
+              targetUser = fData.items[0].email;
+            }
+          }
+        }
+      } catch {
+      }
+    }
     if (targetUser) {
+      match.email = targetUser;
       userVipUntil = await grantVip(targetUser, planMeta.days, match.plan).catch(() => null);
     }
     saveStore2(store);
@@ -1533,6 +1584,68 @@ function createVipRouter() {
     } catch (e) {
       const err = e;
       res.status(err.status || 500).json({ message: err.message });
+    }
+  });
+  router.post("/sync-account", async (req, res) => {
+    try {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      const userId = String(req.body?.userId || "").trim();
+      if (!email && !userId) {
+        return void res.status(400).json({ ok: false, message: "Identificador ausente." });
+      }
+      const store = readStore2();
+      const now = Date.now();
+      let latestUntilMs = 0;
+      let matchedPlan = "mensal";
+      for (const t of store.transactions) {
+        if (t.revoked) continue;
+        const tEmail = String(t.email || "").trim().toLowerCase();
+        let matches = Boolean(email && tEmail === email);
+        if (!matches && email && t.message) {
+          const m = t.message.toLowerCase();
+          if (m.includes(email)) matches = true;
+        }
+        if (!matches && email && t.senderName) {
+          const prefix = email.split("@")[0];
+          if (prefix && prefix.length >= 4 && t.senderName.toLowerCase().includes(prefix)) {
+            matches = true;
+          }
+        }
+        if (matches) {
+          const rawExp = String(t.expiresAt || "").replace(" ", "T");
+          const expMs = Date.parse(rawExp);
+          if (Number.isFinite(expMs) && expMs > latestUntilMs) {
+            latestUntilMs = expMs;
+            matchedPlan = t.plan || "mensal";
+            if (!t.email && email) {
+              t.email = email;
+            }
+          }
+        }
+      }
+      for (const c of store.codes) {
+        if (c.revoked) continue;
+        const cEmail = String(c.email || "").trim().toLowerCase();
+        if (email && cEmail === email) {
+          const rawExp = String(c.expiresAt || "").replace(" ", "T");
+          const expMs = Date.parse(rawExp);
+          if (Number.isFinite(expMs) && expMs > latestUntilMs) {
+            latestUntilMs = expMs;
+            matchedPlan = c.plan || "mensal";
+          }
+        }
+      }
+      if (latestUntilMs > now) {
+        const isoUntil = new Date(latestUntilMs).toISOString();
+        saveStore2(store);
+        const target = email || userId;
+        const days2 = Math.ceil((latestUntilMs - now) / 864e5);
+        await grantVip(target, days2, matchedPlan).catch(() => null);
+        return void res.json({ ok: true, isVip: true, vipUntil: isoUntil, plan: matchedPlan });
+      }
+      return void res.json({ ok: true, isVip: false });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e.message });
     }
   });
   router.post("/webhook", async (req, res) => {

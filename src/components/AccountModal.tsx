@@ -40,9 +40,10 @@ const saveAccounts = (accounts: Account[]) => localStorage.setItem(ACCOUNTS, JSO
 
 export function updateStoredAccount(updated: Account): Account {
   const accounts = readAccounts();
-  const exists = accounts.some((a) => a.email === updated.email);
+  const targetEmail = (updated.email || '').trim().toLowerCase();
+  const exists = accounts.some((a) => (a.email || '').trim().toLowerCase() === targetEmail);
   const next = exists
-    ? accounts.map((a) => (a.email === updated.email ? updated : a))
+    ? accounts.map((a) => ((a.email || '').trim().toLowerCase() === targetEmail ? { ...a, ...updated } : a))
     : [...accounts, updated];
   saveAccounts(next);
   return updated;

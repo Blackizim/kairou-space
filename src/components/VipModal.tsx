@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Crown, ExternalLink, KeyRound, Loader2, X, Zap } from 'lucide-react';
-import { getPocketBaseToken, refreshPocketBase } from '../utils/pocketbase';
+import { getPocketBaseToken, refreshPocketBase, parseVipDate } from '../utils/pocketbase';
 import type { Account } from './AccountModal';
 import {
   VIP_PLANS,
@@ -81,10 +81,13 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
       });
       setPixIdentifier('');
       if (result.userVipUntil) {
-        onUpdateAccount({
-          ...account,
-          vipUntil: new Date(result.userVipUntil).getTime(),
-        });
+        const parsed = parseVipDate(result.userVipUntil);
+        if (parsed) {
+          onUpdateAccount({
+            ...account,
+            vipUntil: parsed,
+          });
+        }
       }
     } catch (error) {
       setFeedback({
@@ -113,10 +116,13 @@ export const VipModal: React.FC<VipModalProps> = ({ account, onUpdateAccount, on
       });
       setVipCode('');
       if (result.userVipUntil) {
-        onUpdateAccount({
-          ...account,
-          vipUntil: new Date(result.userVipUntil).getTime(),
-        });
+        const parsed = parseVipDate(result.userVipUntil);
+        if (parsed) {
+          onUpdateAccount({
+            ...account,
+            vipUntil: parsed,
+          });
+        }
       }
     } catch (error) {
       setFeedback({

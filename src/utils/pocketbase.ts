@@ -45,6 +45,16 @@ const toPB = (p: Profile, user: string) => ({
   max_rating: p.maxRating || '18',
   content_rating: p.maxRating || '18',
 });
+export function parseVipDate(val?: string | number | null): number | undefined {
+  if (!val) return undefined;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : undefined;
+  const str = String(val).trim();
+  if (!str) return undefined;
+  const cleaned = str.replace(' ', 'T');
+  const parsed = Date.parse(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export async function loadPocketAccount(record: { id:string; email:string; vip_until?:string }): Promise<Account> {
   const data = await call(`/collections/profiles/records?perPage=100&filter=${encodeURIComponent(`user="${record.id}"`)}`);
   const profiles = (data.items as PbProfile[]).map(fromPB);
@@ -52,7 +62,37 @@ export async function loadPocketAccount(record: { id:string; email:string; vip_u
     const p = await call('/collections/profiles/records', { method:'POST', body:JSON.stringify(toPB({id:'',name:'Meu perfil',color:'#2e7bff'}, record.id)) });
     profiles.push(fromPB(p));
   }
-  return { email:record.email, salt:'', hash:'', profiles, pbId:record.id, vipUntil:record.vip_until ? Date.parse(record.vip_until) : undefined };
+  let vipUntil = parseVipDate(record.vip_until);
+
+  if (!vipUntil || vipUntil <= Date.now()) {
+    try {
+      const syncRes = await fetch('/api/vip/sync-account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: record.email, userId: record.id }),
+      });
+      if (syncRes.ok) {
+        const syncJson = (await syncRes.json()) as { isVip?: boolean; vipUntil?: string };
+        if (syncJson?.vipUntil) {
+          const syncedDate = parseVipDate(syncJson.vipUntil);
+          if (syncedDate && syncedDate > Date.now()) {
+            vipUntil = syncedDate;
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    email: record.email,
+    salt: '',
+    hash: '',
+    profiles,
+    pbId: record.id,
+    vipUntil,
+  };
 }
 export async function signInPocketBase(email: string, password: string, register: boolean) {
   if (register) await call('/collections/users/records', { method:'POST', body:JSON.stringify({ email, password, passwordConfirm:password }) });

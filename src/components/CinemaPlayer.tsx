@@ -274,6 +274,22 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     };
   }, []);
 
+  // Always reset locked stream & playback state when navigating between episodes or titles
+  useEffect(() => {
+    setLockedStream(null);
+    setStreamIndex(0);
+    setErrorMsg(null);
+    setHasFirstFrame(false);
+    setIsBuffering(true);
+    setDuration(0);
+    setCurrentTime(0);
+    setHasEnded(false);
+    setNextEpDismissed(false);
+    triedIdsRef.current.clear();
+    triedDirectMp4Ref.current.clear();
+    autoRefreshedRef.current = false;
+  }, [item.id, season, episode]);
+
   // Audio tracks state (for multi-audio HLS streams)
   const [audioTracks, setAudioTracks] = useState<
     Array<{ id: number; name: string; lang?: string; isPtBr?: boolean }>
