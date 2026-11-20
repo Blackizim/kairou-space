@@ -667,18 +667,34 @@ export default function App() {
       setIsLoadingMeta(true);
       try {
         const lookupId = rawItem.tmdbId || rawItem.imdbId || rawItem.id;
-        const metaRes = await fetch(
-          `/api/title/${rawItem.mediaType}/${encodeURIComponent(lookupId)}`
-        );
+        const [metaRes, seasonRes] = await Promise.all([
+          fetch(`/api/title/${rawItem.mediaType}/${encodeURIComponent(lookupId)}`),
+          rawItem.mediaType === 'series' && initSeason > 1
+            ? fetch(`/api/title/series/${encodeURIComponent(lookupId)}/season/${initSeason}`).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
         if (metaRes.ok) {
           const metaJson = (await metaRes.json()) as { item?: MediaTitle };
           if (metaJson.item) {
             const enriched = metaJson.item;
+            let seasonEps: EpisodeItem[] = [];
+            if (seasonRes && seasonRes.ok) {
+              try {
+                const sJson = (await seasonRes.json()) as { episodes?: EpisodeItem[] };
+                if (sJson.episodes && Array.isArray(sJson.episodes)) {
+                  seasonEps = sJson.episodes;
+                }
+              } catch {}
+            }
+
             setSelectedTitle((curr) => {
               if (curr?.id !== rawItem.id) return curr;
-              const mergedEpisodes = curr.episodes && curr.episodes.length > (enriched.episodes?.length ?? 0)
-                ? curr.episodes
-                : enriched.episodes;
+              const epMap = new Map<string, EpisodeItem>();
+              for (const ep of [...(curr.episodes ?? []), ...(enriched.episodes ?? []), ...seasonEps]) {
+                epMap.set(`s${ep.season}e${ep.episode}`, ep);
+              }
+              const mergedEpisodes = Array.from(epMap.values());
               return { ...enriched, episodes: mergedEpisodes, rankToday: curr.rankToday ?? enriched.rankToday };
             });
             if (!rawItem.tmdbId && enriched.tmdbId) {

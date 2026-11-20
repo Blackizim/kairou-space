@@ -4452,39 +4452,6 @@ function detectMp4CodecFromBytes(bytes) {
   if (ascii.includes("avc1")) return "h264";
   return "unknown";
 }
-function sortBrowserCompatibleFirst(streams) {
-  const score = (s) => {
-    let pts = s.priorityBoost ?? 0;
-    const hevc = s.codec === "h265" || isLikelyHevcStream(s.url ?? "", s.qualidade);
-    const is4k = isUltraHdQuality(s.qualidade);
-    if (!hevc) pts += 300;
-    if (s.verified) pts += 150;
-    if (s.idioma && /pt|br|dub/i.test(s.idioma)) pts += 120;
-    if (!is4k) pts += 200;
-    if (s.qualidade && /1080p|full\s*hd/i.test(s.qualidade)) pts += 90;
-    else if (s.qualidade && /720p/i.test(s.qualidade)) pts += 25;
-    else if (s.qualidade && /480p|360p/i.test(s.qualidade)) pts += 0;
-    else pts += 40;
-    if (typeof s.videoWidth === "number" && s.videoWidth > 0) {
-      if (s.videoWidth >= 1880) pts += 25;
-      else if (s.videoWidth >= 1600) pts += 10;
-    }
-    if (s.formato === "hls") pts += 14;
-    else if (s.formato === "mp4") pts += 6;
-    if (typeof s.bitrateBps === "number" && s.bitrateBps > 0) {
-      if (s.bitrateBps >= 25e5) pts += 18;
-      else if (s.bitrateBps >= 14e5) pts += 10;
-      else if (s.bitrateBps < 8e5) pts -= 15;
-    }
-    if (typeof s.latencyMs === "number") {
-      if (s.latencyMs <= 350) pts += 22;
-      else if (s.latencyMs <= 750) pts += 14;
-      else if (s.latencyMs <= 1300) pts += 6;
-    }
-    return pts;
-  };
-  return [...streams].sort((a, b) => score(b) - score(a));
-}
 function inferStreamFormatFromUrlOrMeta(url, hintText) {
   const lowerUrl = url.toLowerCase();
   if (lowerUrl.includes(".m3u8") || lowerUrl.includes("m3u8") || lowerUrl.includes("/master.txt") || lowerUrl.includes("playlist.m3u8")) {
@@ -4753,6 +4720,686 @@ function extractBloggerMp4Urls(html) {
     out.push({ url: raw, quality, rank });
   }
   return out.sort((a, b) => b.rank - a.rank).map(({ url, quality }) => ({ url, quality }));
+}
+
+// server/sourcesEngine.ts
+var circuitBreakers = /* @__PURE__ */ new Map();
+function isProviderAvailable(providerName) {
+  const state = circuitBreakers.get(providerName);
+  if (!state) return true;
+  if (Date.now() < state.pausedUntil) return false;
+  return true;
+}
+function recordProviderSuccess(providerName) {
+  const state = circuitBreakers.get(providerName);
+  if (state) {
+    state.failCount = 0;
+    state.pausedUntil = 0;
+  }
+}
+function recordProviderFailure(providerName) {
+  let state = circuitBreakers.get(providerName);
+  if (!state) {
+    state = { failCount: 1, pausedUntil: 0 };
+    circuitBreakers.set(providerName, state);
+  } else {
+    state.failCount++;
+    if (state.failCount >= 3) {
+      state.pausedUntil = Date.now() + 45e3;
+    }
+  }
+}
+function calculateStreamScore(s) {
+  let score = 0;
+  const isKoi = s.providerLabel === "Koi" || /koi|mbox/i.test(s.providerLabel || "");
+  if (isKoi) {
+    score += 25e4;
+  }
+  const isPt = Boolean(s.isPtBr || /pt|br|dublado|portugu[eê]s/i.test(s.idioma || ""));
+  const isAnimeJp = /kitsune|shiro|akira|ronin|sora|kuro/i.test(s.providerLabel || "");
+  const isEnOrJp = Boolean(isAnimeJp || /en|us|ingl[eê]s|original|legendado|ja|jap/i.test(s.idioma || ""));
+  if (isPt) {
+    score += 15e4;
+  } else if (isEnOrJp) {
+    score += 5e4;
+  }
+  const qStr = s.qualidade || "";
+  if (/4k|2160/i.test(qStr)) {
+    score += 21600;
+  } else if (/1440/i.test(qStr)) {
+    score += 14400;
+  } else if (/1080|full\s*hd/i.test(qStr)) {
+    score += 10800;
+  } else if (/720|hd/i.test(qStr)) {
+    score += 7200;
+  } else if (/480/i.test(qStr)) {
+    score += 4800;
+  } else if (/360/i.test(qStr)) {
+    score += 3600;
+  } else {
+    score += 7200;
+  }
+  if (s.format === "hls") {
+    score += 6e3;
+  } else if (s.format === "mp4") {
+    score += 4e3;
+  } else if (s.format === "dash") {
+    score += 2e3;
+  }
+  if (s.hasMultiQuality) score += 300;
+  if (s.hasEmbeddedSubs) score += 200;
+  if (typeof s.latencyMs === "number" && s.latencyMs > 0) {
+    score -= Math.min(2e3, s.latencyMs * 0.25);
+  }
+  return score;
+}
+function getHlsLolBase() {
+  const custom = process.env.HLS_LOL_PROXY_URL?.trim();
+  if (custom && custom.startsWith("http")) {
+    return custom.replace(/\/+$/, "");
+  }
+  return "https://stream.hls.lol";
+}
+var DEFAULT_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Accept": "application/json, text/plain, */*"
+};
+async function fetchJsonSafe(url, headers = {}, timeoutMs = 3e3) {
+  try {
+    const res = await fetch(url, {
+      headers: { ...DEFAULT_FETCH_HEADERS, ...headers },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+async function extractKoiMbox(target, timeoutMs = 2800) {
+  const pName = "Koi";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/mbox?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  if (!data?.tracks || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const t of data.tracks) {
+    if (!t.url || !t.url.startsWith("http")) continue;
+    const langStr = t.lang || t.mode || "Original";
+    const isPt = /portug|pt|dub|bra/i.test(langStr);
+    const qStr = t.quality || "1080p";
+    const is4k = /4k|2160/i.test(qStr);
+    const format = t.kind === "dash" || t.url.includes(".mpd") ? "dash" : t.url.includes(".mp4") ? "mp4" : "hls";
+    out.push({
+      rawUrl: t.url,
+      referer: "https://atlantic.bz/",
+      format,
+      codec: "h264",
+      idioma: isPt ? "pt-br" : langStr.toLowerCase(),
+      qualidade: qStr,
+      isPtBr: isPt,
+      is4k,
+      priorityBoost: isPt ? 25e4 : 2e5,
+      providerLabel: "Koi",
+      hasMultiQuality: true,
+      hasEmbeddedSubs: true,
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractAetherNautilus(target, timeoutMs = 2800) {
+  const pName = "Aether/Nautilus";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/q62?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  const rawList = data?.tracks || data?.streams;
+  if (!rawList || !Array.isArray(rawList) || rawList.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const item of rawList) {
+    if (!item.url || !item.url.startsWith("http")) continue;
+    const isMp4 = item.url.includes(".mp4");
+    const isHls = !isMp4;
+    const providerLabel = isHls ? "Aether" : "Nautilus";
+    const isPt = /portug|pt|dub|bra/i.test(item.lang || "");
+    out.push({
+      rawUrl: item.url,
+      referer: "https://atlantic.bz/",
+      format: isMp4 ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : (item.lang || "en").toLowerCase(),
+      qualidade: item.quality || "1080p Full HD",
+      isPtBr: isPt,
+      is4k: /4k|2160/i.test(item.quality || ""),
+      priorityBoost: isHls ? 60 : 40,
+      providerLabel,
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractVelvetVidbox(target, timeoutMs = 2600) {
+  const pName = "Velvet";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/vidbox?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  const list = data?.tracks || data?.streams;
+  if (!list || !Array.isArray(list) || list.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const s of list) {
+    if (!s.url || !s.url.startsWith("http")) continue;
+    const isPt = /portug|pt|dub/i.test(s.lang || "");
+    out.push({
+      rawUrl: s.url,
+      referer: "https://atlantic.bz/",
+      format: s.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : (s.lang || "en").toLowerCase(),
+      qualidade: s.quality || "1080p Full HD",
+      isPtBr: isPt,
+      is4k: /4k|2160/i.test(s.quality || ""),
+      priorityBoost: 48,
+      providerLabel: "Velvet",
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractSolstice(target, timeoutMs = 2600) {
+  const pName = "Solstice";
+  if (!isProviderAvailable(pName)) return [];
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&type=tv&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}&type=movie`;
+  const url = `https://lightspeed.hls.lol/v1/source?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://lightspeed.hls.lol/" }, timeoutMs);
+  const out = [];
+  const latencyMs = Date.now() - started;
+  if (data?.sources && Array.isArray(data.sources)) {
+    for (const item of data.sources) {
+      if (!item.url || !item.url.startsWith("http")) continue;
+      out.push({
+        rawUrl: item.url,
+        referer: "https://lightspeed.hls.lol/",
+        format: item.url.includes(".mp4") ? "mp4" : "hls",
+        codec: "h264",
+        idioma: (item.lang || "en").toLowerCase(),
+        qualidade: item.quality || "1080p Full HD",
+        isPtBr: /pt|br/i.test(item.lang || ""),
+        is4k: /4k|2160/i.test(item.quality || ""),
+        priorityBoost: 46,
+        providerLabel: "Solstice",
+        latencyMs
+      });
+    }
+  } else if (data?.url || data?.streamUrl) {
+    const streamUrl = data.url || data.streamUrl;
+    out.push({
+      rawUrl: streamUrl,
+      referer: "https://lightspeed.hls.lol/",
+      format: streamUrl.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: "en",
+      qualidade: "1080p Full HD",
+      isPtBr: false,
+      is4k: false,
+      priorityBoost: 46,
+      providerLabel: "Solstice",
+      latencyMs
+    });
+  }
+  if (out.length > 0) recordProviderSuccess(pName);
+  else recordProviderFailure(pName);
+  return out;
+}
+async function extractLyraShegu(target, timeoutMs = 2600) {
+  const pName = "Lyra";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/shegu?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  const list = data?.tracks || data?.streams;
+  if (!list || !Array.isArray(list) || list.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const s of list) {
+    if (!s.url || !s.url.startsWith("http")) continue;
+    const isPt = /portug|pt|dub/i.test(s.lang || "");
+    out.push({
+      rawUrl: s.url,
+      referer: "https://atlantic.bz/",
+      format: s.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : (s.lang || "en").toLowerCase(),
+      qualidade: s.quality || "1080p Full HD",
+      isPtBr: isPt,
+      is4k: /4k|2160/i.test(s.quality || ""),
+      priorityBoost: 44,
+      providerLabel: "Lyra",
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractPolarisMoscow(target, timeoutMs = 2600) {
+  const pName = "Polaris";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/moscow?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  if (!data?.tracks || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const s of data.tracks) {
+    if (!s.url || !s.url.startsWith("http")) continue;
+    const isPt = /portug|pt|dub/i.test(s.lang || "");
+    out.push({
+      rawUrl: s.url,
+      referer: "https://atlantic.bz/",
+      format: s.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : (s.lang || "en").toLowerCase(),
+      qualidade: s.quality || "1080p Full HD",
+      isPtBr: isPt,
+      is4k: /4k|2160/i.test(s.quality || ""),
+      priorityBoost: 42,
+      providerLabel: "Polaris",
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractOrionAmnesty(target, timeoutMs = 2600) {
+  const pName = "Orion";
+  if (!isProviderAvailable(pName)) return [];
+  const base = getHlsLolBase();
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `tmdbId=${encodeURIComponent(target.tmdbId)}&season=${target.season}&episode=${target.episode}` : `tmdbId=${encodeURIComponent(target.tmdbId)}`;
+  const url = `${base}/amnesty?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://atlantic.bz/" }, timeoutMs);
+  if (!data?.tracks || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const s of data.tracks) {
+    if (!s.url || !s.url.startsWith("http")) continue;
+    const isPt = /portug|pt|dub/i.test(s.lang || "");
+    out.push({
+      rawUrl: s.url,
+      referer: "https://atlantic.bz/",
+      format: s.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : (s.lang || "en").toLowerCase(),
+      qualidade: s.quality || "1080p Full HD",
+      isPtBr: isPt,
+      is4k: /4k|2160/i.test(s.quality || ""),
+      priorityBoost: 40,
+      providerLabel: "Orion",
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractObsidianPunkflix(target, timeoutMs = 2800) {
+  const pName = "Obsidian";
+  if (!isProviderAvailable(pName)) return [];
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const url = isSeries ? `https://punkflix.net/tv/${target.tmdbId}/${target.season}/${target.episode}.json` : `https://punkflix.net/movie/${target.tmdbId}.json`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://punkflix.net/" }, timeoutMs);
+  if (!data?.streams || !Array.isArray(data.streams) || data.streams.length === 0) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const out = [];
+  for (const s of data.streams) {
+    if (!s.url || !s.url.startsWith("http")) continue;
+    const title = `${s.name || ""} ${s.title || ""}`;
+    const isPt = /dub|pt|bra/i.test(title);
+    out.push({
+      rawUrl: s.url,
+      referer: "https://punkflix.net/",
+      format: s.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isPt ? "pt-br" : "en-us",
+      qualidade: "4K Ultra HD",
+      isPtBr: isPt,
+      is4k: true,
+      priorityBoost: 38,
+      providerLabel: "Obsidian (4K)",
+      latencyMs
+    });
+  }
+  return out;
+}
+async function extractVortexSilvia(target, timeoutMs = 2600) {
+  const pName = "Vortex";
+  if (!isProviderAvailable(pName)) return [];
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const qs = isSeries ? `id=${encodeURIComponent(target.tmdbId)}&s=${target.season}&e=${target.episode}` : `id=${encodeURIComponent(target.tmdbId)}`;
+  const url = `https://it.hls.lol/resolve?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://it.hls.lol/" }, timeoutMs);
+  const streamUrl = data?.url || data?.sources?.[0]?.url;
+  if (!streamUrl || !streamUrl.startsWith("http")) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  return [
+    {
+      rawUrl: streamUrl,
+      referer: "https://it.hls.lol/",
+      format: streamUrl.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: "en-us",
+      qualidade: "1080p Full HD",
+      isPtBr: false,
+      is4k: false,
+      priorityBoost: 36,
+      providerLabel: "Vortex",
+      latencyMs
+    }
+  ];
+}
+async function extractZephyrFlikhub(target, timeoutMs = 2600) {
+  const pName = "Zephyr";
+  if (!isProviderAvailable(pName)) return [];
+  const isSeries = target.kind === "tv" && target.season && target.episode;
+  const endpoint2 = isSeries ? "tv" : "movie";
+  const qs = isSeries ? `id=${encodeURIComponent(target.tmdbId)}&s=${target.season}&e=${target.episode}` : `id=${encodeURIComponent(target.tmdbId)}`;
+  const url = `https://proxy3.flikhub.net/${endpoint2}?${qs}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, { "Referer": "https://flikhub.net/" }, timeoutMs);
+  const streamUrl = data?.url || data?.streamUrl || data?.sources?.[0]?.url;
+  if (!streamUrl || !streamUrl.startsWith("http")) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  return [
+    {
+      rawUrl: streamUrl,
+      referer: "https://flikhub.net/",
+      format: streamUrl.includes(".mp4") ? "mp4" : "hls",
+      codec: "h265",
+      // HEVC
+      idioma: "en-us",
+      qualidade: "1080p HEVC",
+      isPtBr: false,
+      is4k: false,
+      priorityBoost: 30,
+      providerLabel: "Zephyr (HEVC)",
+      latencyMs
+    }
+  ];
+}
+async function resolveAniListFromTmdb(tmdbId) {
+  try {
+    const data = await fetchJsonSafe(`https://anime.hls.lol/ids?tmdb=${encodeURIComponent(tmdbId)}`, {}, 1600);
+    if (data?.found && typeof data.anilistId === "number") {
+      return data.anilistId;
+    }
+  } catch {
+  }
+  return null;
+}
+async function extractKitsuneAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Kitsune Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://core.justanime.to/api/watch/${anilistId}/episode/${ep}/momo`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {
+    "Referer": "https://justanime.to/",
+    "Origin": "https://justanime.to"
+  }, timeoutMs);
+  const out = [];
+  const latencyMs = Date.now() - started;
+  const addSources = (sources, isDub = false) => {
+    if (!sources || !Array.isArray(sources)) return;
+    for (const s of sources) {
+      if (!s.url || !s.url.startsWith("http")) continue;
+      out.push({
+        rawUrl: s.url,
+        referer: "https://justanime.to/",
+        format: s.url.includes(".mp4") ? "mp4" : "hls",
+        codec: "h264",
+        idioma: isDub ? "pt-br" : "ja",
+        qualidade: s.quality || "1080p HD",
+        isPtBr: isDub,
+        is4k: false,
+        priorityBoost: isDub ? 85 : 55,
+        providerLabel: "Kitsune Anime",
+        latencyMs
+      });
+    }
+  };
+  addSources(data?.dub?.sources, true);
+  addSources(data?.sub?.sources, false);
+  if (out.length > 0) recordProviderSuccess(pName);
+  else recordProviderFailure(pName);
+  return out;
+}
+async function extractShiroAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Shiro Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://core.justanime.to/api/watch/${anilistId}/episode/${ep}/onyx`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {
+    "Referer": "https://justanime.to/",
+    "Origin": "https://justanime.to"
+  }, timeoutMs);
+  const out = [];
+  const latencyMs = Date.now() - started;
+  const addSources = (sources, isDub = false) => {
+    if (!sources || !Array.isArray(sources)) return;
+    for (const s of sources) {
+      if (!s.url || !s.url.startsWith("http")) continue;
+      out.push({
+        rawUrl: s.url,
+        referer: "https://justanime.to/",
+        format: s.url.includes(".mp4") ? "mp4" : "hls",
+        codec: "h264",
+        idioma: isDub ? "pt-br" : "ja",
+        qualidade: s.quality || "1080p HD",
+        isPtBr: isDub,
+        is4k: false,
+        priorityBoost: isDub ? 84 : 54,
+        providerLabel: "Shiro Anime",
+        latencyMs
+      });
+    }
+  };
+  addSources(data?.dub?.sources, true);
+  addSources(data?.sub?.sources, false);
+  if (out.length > 0) recordProviderSuccess(pName);
+  else recordProviderFailure(pName);
+  return out;
+}
+async function extractAkiraAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Akira Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://core.justanime.to/api/watch/${anilistId}/episode/${ep}/revo`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {
+    "Referer": "https://justanime.to/",
+    "Origin": "https://justanime.to"
+  }, timeoutMs);
+  const out = [];
+  const latencyMs = Date.now() - started;
+  const addSources = (sources, isDub = false) => {
+    if (!sources || !Array.isArray(sources)) return;
+    for (const s of sources) {
+      if (!s.url || !s.url.startsWith("http")) continue;
+      out.push({
+        rawUrl: s.url,
+        referer: "https://justanime.to/",
+        format: s.url.includes(".mp4") ? "mp4" : "hls",
+        codec: "h264",
+        idioma: isDub ? "pt-br" : "ja",
+        qualidade: s.quality || "1080p HD",
+        isPtBr: isDub,
+        is4k: false,
+        priorityBoost: isDub ? 83 : 53,
+        providerLabel: "Akira Anime",
+        latencyMs
+      });
+    }
+  };
+  addSources(data?.dub?.sources, true);
+  addSources(data?.sub?.sources, false);
+  if (out.length > 0) recordProviderSuccess(pName);
+  else recordProviderFailure(pName);
+  return out;
+}
+async function extractRoninAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Ronin Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://anime.hls.lol/zokoanime?anilistId=${anilistId}&episode=${ep}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {}, timeoutMs);
+  if (!data?.found || !data?.url || !data.url.startsWith("http")) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const isDub = /dub|pt|bra/i.test(data.audioLang || "");
+  return [
+    {
+      rawUrl: data.url,
+      referer: "https://anime.hls.lol/",
+      format: data.kind === "mp4" || data.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isDub ? "pt-br" : "ja",
+      qualidade: data.quality ? `${data.quality}p` : "1080p HD",
+      isPtBr: isDub,
+      is4k: false,
+      priorityBoost: isDub ? 82 : 52,
+      providerLabel: "Ronin Anime",
+      latencyMs
+    }
+  ];
+}
+async function extractSoraAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Sora Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://anime.hls.lol/animesalt?anilistId=${anilistId}&episode=${ep}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {}, timeoutMs);
+  if (!data?.found || !data?.url || !data.url.startsWith("http")) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const isDub = /dub|pt|bra/i.test(data.audioLang || "");
+  return [
+    {
+      rawUrl: data.url,
+      referer: "https://anime.hls.lol/",
+      format: data.kind === "mp4" || data.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isDub ? "pt-br" : "ja",
+      qualidade: data.quality ? `${data.quality}p` : "1080p HD",
+      isPtBr: isDub,
+      is4k: false,
+      priorityBoost: isDub ? 81 : 51,
+      providerLabel: "Sora Anime",
+      latencyMs
+    }
+  ];
+}
+async function extractKuroAnime(anilistId, ep, timeoutMs = 2800) {
+  const pName = "Kuro Anime";
+  if (!isProviderAvailable(pName)) return [];
+  const url = `https://anime.hls.lol/animegg?anilistId=${anilistId}&episode=${ep}`;
+  const started = Date.now();
+  const data = await fetchJsonSafe(url, {}, timeoutMs);
+  if (!data?.found || !data?.url || !data.url.startsWith("http")) {
+    recordProviderFailure(pName);
+    return [];
+  }
+  recordProviderSuccess(pName);
+  const latencyMs = Date.now() - started;
+  const isDub = /dub|pt|bra/i.test(data.audioLang || "");
+  return [
+    {
+      rawUrl: data.url,
+      referer: "https://anime.hls.lol/",
+      format: data.kind === "mp4" || data.url.includes(".mp4") ? "mp4" : "hls",
+      codec: "h264",
+      idioma: isDub ? "pt-br" : "ja",
+      qualidade: data.quality ? `${data.quality}p` : "1080p HD",
+      isPtBr: isDub,
+      is4k: false,
+      priorityBoost: isDub ? 80 : 50,
+      providerLabel: "Kuro Anime",
+      latencyMs
+    }
+  ];
+}
+async function fetchNatsukiSubs(tmdbId, timeoutMs = 2400) {
+  const url = `https://natsuki.hls.lol/subs?tmdbId=${encodeURIComponent(tmdbId)}`;
+  const data = await fetchJsonSafe(url, {
+    "Referer": "https://atlantic.bz/"
+  }, timeoutMs);
+  if (!data || !Array.isArray(data)) return [];
+  return data.filter((s) => s.url && s.url.startsWith("http")).map((s) => ({
+    rawUrl: s.url,
+    referer: "https://natsuki.hls.lol/",
+    lang: s.lang || "pt",
+    label: s.label || "Portugu\xEAs (Natsuki)"
+  }));
 }
 
 // server.ts
@@ -5173,7 +5820,8 @@ async function extractWatchPlayPipeline(target, timeoutMs = 1700) {
         qualidade: "720p HD",
         isPtBr: isDub,
         is4k: false,
-        priorityBoost: idx === 0 ? 28 : 20
+        priorityBoost: idx === 0 ? 28 : 20,
+        providerLabel: "Iara"
       });
     })
   );
@@ -5236,7 +5884,8 @@ async function extractPlayerFlixPipeline(target, timeoutMs = 1800) {
                 isPtBr: isPt,
                 is4k: false,
                 priorityBoost: isPt ? 32 : 12,
-                resolvedTitle
+                resolvedTitle,
+                providerLabel: "Jade"
               });
             }
           } catch {
@@ -5412,7 +6061,8 @@ async function extractStremioAddon(opts) {
           qualidade: rawQuality,
           isPtBr: isPt,
           is4k,
-          priorityBoost: opts.priorityBoost - idx * 2 + (is4k ? 10 : 0)
+          priorityBoost: opts.priorityBoost - idx * 2 + (is4k ? 10 : 0),
+          providerLabel: opts.providerLabel
         });
         for (const sub of st.subtitles ?? []) {
           if (!sub.url || !sub.url.startsWith("http")) continue;
@@ -6092,12 +6742,26 @@ async function verifyStreamCandidate(st) {
       priorityBoost: st.priorityBoost + hostPenalty
     };
   }
+  const looksDash = st.format === "dash" || ctLower.includes("dash+xml") || finalLower.includes(".mpd") || trimmedText.startsWith("<MPD") || trimmedText.includes("<MPD");
+  if (looksDash) {
+    recordHostHealth(st.rawUrl, true, latencyMs);
+    return {
+      ...st,
+      format: "dash",
+      codec: "h264",
+      qualidade: detectedQualidade || "1080p Full HD",
+      is4k: detectedIs4k,
+      verified: true,
+      latencyMs,
+      priorityBoost: st.priorityBoost + hostPenalty
+    };
+  }
   recordHostHealth(st.rawUrl, false, latencyMs);
   return null;
 }
 async function verifyStreamsBatch(candidates) {
   if (candidates.length === 0) return [];
-  const topCandidates = candidates.sort((a, b) => (b.priorityBoost ?? 0) - (a.priorityBoost ?? 0)).slice(0, 6);
+  const topCandidates = candidates.sort((a, b) => (b.priorityBoost ?? 0) - (a.priorityBoost ?? 0)).slice(0, 16);
   const results = await Promise.all(
     topCandidates.map((c) => verifyStreamCandidate(c))
   );
@@ -6113,12 +6777,8 @@ function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt, cached, resolve
       dedupedStreams.push(st);
     }
   }
-  const ranked = sortBrowserCompatibleFirst(
-    dedupedStreams.map((s) => ({
-      ...s,
-      url: s.rawUrl,
-      formato: s.format
-    }))
+  const ranked = dedupedStreams.sort(
+    (a, b) => calculateStreamScore(b) - calculateStreamScore(a)
   );
   const h264Only = ranked.filter((r) => r.codec !== "h265");
   const hevcTail = ranked.filter((r) => r.codec === "h265");
@@ -6127,10 +6787,11 @@ function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt, cached, resolve
     const streamId = registerStream(item.rawUrl, item.referer, item.format, item.extraHeaders);
     const qMeta = formatQualityDisplay(item.qualidade);
     const aMeta = formatAudioDisplay(item.idioma, item.qualidade);
-    const ext = item.format === "mp4" ? "media.mp4" : "master.m3u8";
+    const ext = item.format === "mp4" ? "media.mp4" : item.format === "dash" ? "manifest.mpd" : "master.m3u8";
+    const label = item.providerLabel ? `${item.providerLabel}${item.isPtBr ? " \xB7 Dublado" : ""}` : `Servidor ${idx + 1}`;
     return {
       id: streamId,
-      label: `Servidor ${idx + 1}`,
+      label,
       audio: aMeta.audio,
       quality: qMeta.quality,
       codec: item.codec,
@@ -6146,9 +6807,14 @@ function buildAnonymizedSnapshot(rawStreams, rawSubs, startedAt, cached, resolve
     if (!subMap.has(key)) subMap.set(key, sub);
   }
   const sortedSubs = [...subMap.values()].sort((a, b) => {
-    const ra = normalizeSubtitleLang(a.lang, a.label).rank;
-    const rb = normalizeSubtitleLang(b.lang, b.label).rank;
-    return rb - ra;
+    const scoreSub = (s) => {
+      let sc = 0;
+      if (/pt|br|portugu/i.test(s.lang) || /portugu/i.test(s.label)) sc += 1e3;
+      else if (/en|ingl/i.test(s.lang) || /ingl/i.test(s.label)) sc += 500;
+      if (s.rawUrl.endsWith(".vtt")) sc += 50;
+      return sc;
+    };
+    return scoreSub(b) - scoreSub(a);
   });
   const anonymizedSubtitles = sortedSubs.slice(0, 14).map((sub) => {
     const subId = registerSubtitle(sub.rawUrl, sub.referer, sub.lang, sub.label, sub.extraHeaders);
@@ -6182,11 +6848,54 @@ function launchAllPipelines(parsed, imdbPromise, onBatch) {
     } catch {
     }
   };
+  const runSourceExtractor = async (extractor) => {
+    try {
+      const extractedStreams = await extractor();
+      const verified = await verifyStreamsBatch(extractedStreams);
+      if (verified.length > 0) {
+        onBatch({
+          streams: verified,
+          subtitles: []
+        });
+      }
+    } catch {
+    }
+  };
+  const runSubtitleFetcher = async (fetcher) => {
+    try {
+      const subs = await fetcher();
+      if (subs.length > 0) {
+        onBatch({
+          streams: [],
+          subtitles: subs
+        });
+      }
+    } catch {
+    }
+  };
+  const targetQuery = {
+    kind: parsed.kind,
+    tmdbId: parsed.tmdbId,
+    season: parsed.kind === "tv" ? parsed.season : void 0,
+    episode: parsed.kind === "tv" ? parsed.episode : void 0
+  };
   const tier1Tasks = [
     runAndVerify(extractWatchPlayPipeline(parsed, 1500)),
     runAndVerify(extractHorcruxPipeline(parsed, 1200)),
     runAndVerify(extractMultiNodePipeline(parsed, 2200)),
-    runAndVerify(extractPlayerFlixPipeline(parsed, 1600))
+    runAndVerify(extractPlayerFlixPipeline(parsed, 1600)),
+    // Fontes Multi-Áudio e Internacionais
+    runSourceExtractor(() => extractKoiMbox(targetQuery, 2800)),
+    runSourceExtractor(() => extractAetherNautilus(targetQuery, 2800)),
+    runSourceExtractor(() => extractVelvetVidbox(targetQuery, 2600)),
+    runSourceExtractor(() => extractSolstice(targetQuery, 2600)),
+    runSourceExtractor(() => extractLyraShegu(targetQuery, 2600)),
+    runSourceExtractor(() => extractPolarisMoscow(targetQuery, 2600)),
+    runSourceExtractor(() => extractOrionAmnesty(targetQuery, 2600)),
+    runSourceExtractor(() => extractObsidianPunkflix(targetQuery, 2800)),
+    runSourceExtractor(() => extractVortexSilvia(targetQuery, 2600)),
+    runSourceExtractor(() => extractZephyrFlikhub(targetQuery, 2600)),
+    runSubtitleFetcher(() => fetchNatsukiSubs(parsed.tmdbId, 2400))
   ];
   const tier2Task = imdbPromise.then(async (imdbId) => {
     if (!imdbId) return;
@@ -6219,7 +6928,8 @@ function launchAllPipelines(parsed, imdbPromise, onBatch) {
             referer: "https://da5f663b4690-kingvod.baby-beamup.club/",
             timeoutMs: 1700,
             priorityBoost: 54,
-            defaultPtBr: true
+            defaultPtBr: true,
+            providerLabel: "Coruja"
           })
         ),
         runAndVerify(
@@ -6258,22 +6968,41 @@ function launchAllPipelines(parsed, imdbPromise, onBatch) {
             referer: "https://fenixflix.fenixhub.online/",
             timeoutMs: 7500,
             priorityBoost: 60,
-            defaultPtBr: true
+            defaultPtBr: true,
+            providerLabel: "Arara"
           })
         )
       );
     }
     await Promise.allSettled(imdbTasks);
   });
-  const animeTask = parsed.kind === "tv" ? resolveAnimeContext(parsed).then(async (ctx) => {
-    if (!ctx || !ctx.isAnime) return;
-    await Promise.allSettled([
-      runAndVerify(extractAnimesFhdPipeline(ctx, parsed, 2800)),
-      runAndVerify(extractAnimesDigitalPipeline(ctx, parsed, 2800)),
-      runAndVerify(extractAniTubePipeline(ctx, parsed, 2800)),
-      runAndVerify(extractAnrollPipeline(ctx, parsed, 2900))
+  const animeTask = parsed.kind === "tv" ? (async () => {
+    const [ctx, anilistId] = await Promise.all([
+      resolveAnimeContext(parsed),
+      resolveAniListFromTmdb(parsed.tmdbId)
     ]);
-  }) : Promise.resolve();
+    const subtasks = [];
+    if (ctx && ctx.isAnime) {
+      subtasks.push(
+        runAndVerify(extractAnimesFhdPipeline(ctx, parsed, 2800)),
+        runAndVerify(extractAnimesDigitalPipeline(ctx, parsed, 2800)),
+        runAndVerify(extractAniTubePipeline(ctx, parsed, 2800)),
+        runAndVerify(extractAnrollPipeline(ctx, parsed, 2900))
+      );
+    }
+    if (anilistId) {
+      const ep = parsed.episode;
+      subtasks.push(
+        runSourceExtractor(() => extractKitsuneAnime(anilistId, ep, 2800)),
+        runSourceExtractor(() => extractShiroAnime(anilistId, ep, 2800)),
+        runSourceExtractor(() => extractAkiraAnime(anilistId, ep, 2800)),
+        runSourceExtractor(() => extractRoninAnime(anilistId, ep, 2800)),
+        runSourceExtractor(() => extractSoraAnime(anilistId, ep, 2800)),
+        runSourceExtractor(() => extractKuroAnime(anilistId, ep, 2800))
+      );
+    }
+    await Promise.allSettled(subtasks);
+  })() : Promise.resolve();
   return Promise.allSettled([...tier1Tasks, tier2Task, animeTask]).then(() => {
   });
 }
@@ -7419,7 +8148,7 @@ async function startServer() {
             url: resolved.url,
             referer: resolved.referer,
             extraHeaders: resolved.extraHeaders,
-            format: req.params.file.endsWith(".mp4") ? "mp4" : "hls",
+            format: req.params.file.endsWith(".mp4") ? "mp4" : req.params.file.endsWith(".mpd") ? "dash" : "hls",
             expiresAt: Date.now() + STREAM_REGISTRY_TTL_MS
           };
           streamRegistry.set(req.params.id, entry);

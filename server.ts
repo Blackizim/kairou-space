@@ -53,6 +53,30 @@ import {
   matchExactEpisode,
   pickTopAnimeCandidates,
 } from './src/utils/animeMatcher.ts';
+import {
+  calculateStreamScore,
+  extractKoiMbox,
+  extractAetherNautilus,
+  extractVelvetVidbox,
+  extractSolstice,
+  extractLyraShegu,
+  extractPolarisMoscow,
+  extractOrionAmnesty,
+  extractObsidianPunkflix,
+  extractVortexSilvia,
+  extractZephyrFlikhub,
+  resolveAniListFromTmdb,
+  extractKitsuneAnime,
+  extractShiroAnime,
+  extractAkiraAnime,
+  extractRoninAnime,
+  extractSoraAnime,
+  extractKuroAnime,
+  fetchNatsukiSubs,
+  fetchAthenaImdbMeta,
+  fetchTheIntroDbTimes,
+  type TargetQuery,
+} from './server/sourcesEngine.ts';
 
 const PORT = Number(process.env.PORT ?? 3001);
 
@@ -130,7 +154,7 @@ interface StoredTarget {
   url: string;
   referer: string;
   extraHeaders?: Record<string, string>;
-  format: 'hls' | 'mp4';
+  format: 'hls' | 'mp4' | 'dash';
   expiresAt: number;
 }
 
@@ -222,7 +246,7 @@ function registerProxyToken(
 function registerStream(
   url: string,
   referer: string,
-  format: 'hls' | 'mp4',
+  format: 'hls' | 'mp4' | 'dash',
   extraHeaders?: Record<string, string>
 ): string {
   pruneExpiredMaps();
@@ -342,13 +366,16 @@ interface InternalExtractedStream {
   rawUrl: string;
   referer: string;
   extraHeaders?: Record<string, string>;
-  format: 'hls' | 'mp4';
+  format: 'hls' | 'mp4' | 'dash';
   codec: 'h264' | 'h265';
   idioma: string | null;
   qualidade: string | null;
   isPtBr: boolean;
   is4k: boolean;
   priorityBoost: number;
+  providerLabel?: string;
+  hasMultiQuality?: boolean;
+  hasEmbeddedSubs?: boolean;
   verified?: boolean;
   latencyMs?: number;
   bitrateBps?: number;
@@ -371,7 +398,7 @@ export interface AnonymizedStream {
   audio: string;
   quality: string;
   codec: 'h264' | 'h265';
-  format: 'hls' | 'mp4';
+  format: 'hls' | 'mp4' | 'dash';
   isPtBr: boolean;
   is4k: boolean;
   streamUrl: string;
@@ -711,6 +738,7 @@ async function extractWatchPlayPipeline(
         isPtBr: isDub,
         is4k: false,
         priorityBoost: idx === 0 ? 28 : 20,
+        providerLabel: 'Iara',
       });
     })
   );
@@ -796,6 +824,7 @@ async function extractPlayerFlixPipeline(
                 is4k: false,
                 priorityBoost: isPt ? 32 : 12,
                 resolvedTitle,
+                providerLabel: 'Jade',
               });
             }
           } catch {
@@ -1048,6 +1077,7 @@ async function extractStremioAddon(
     referer: string;
     timeoutMs: number;
     priorityBoost: number;
+    providerLabel?: string;
     defaultPtBr?: boolean;
     resolveRedirects?: boolean;
     skipIfNotWebReadyHevc?: boolean;
@@ -1107,6 +1137,7 @@ async function extractStremioAddon(
           isPtBr: isPt,
           is4k,
           priorityBoost: opts.priorityBoost - idx * 2 + (is4k ? 10 : 0),
+          providerLabel: opts.providerLabel,
         });
 
         for (const sub of st.subtitles ?? []) {
@@ -1929,6 +1960,28 @@ async function verifyStreamCandidate(
     };
   }
 
+  // Case 3: DASH Manifest (.mpd / <MPD / dash+xml)
+  const looksDash =
+    st.format === 'dash' ||
+    ctLower.includes('dash+xml') ||
+    finalLower.includes('.mpd') ||
+    trimmedText.startsWith('<MPD') ||
+    trimmedText.includes('<MPD');
+
+  if (looksDash) {
+    recordHostHealth(st.rawUrl, true, latencyMs);
+    return {
+      ...st,
+      format: 'dash',
+      codec: 'h264',
+      qualidade: detectedQualidade || '1080p Full HD',
+      is4k: detectedIs4k,
+      verified: true,
+      latencyMs,
+      priorityBoost: st.priorityBoost + hostPenalty,
+    };
+  }
+
   recordHostHealth(st.rawUrl, false, latencyMs);
   return null;
 }
@@ -1937,10 +1990,10 @@ async function verifyStreamsBatch(
   candidates: InternalExtractedStream[]
 ): Promise<InternalExtractedStream[]> {
   if (candidates.length === 0) return [];
-  // Sort candidates by priorityBoost descending and cap to top 6 to prevent runaway concurrent HTTP probes
+  // Sort candidates by priorityBoost descending and cap to top 16 to allow rich sources while preventing runaway probes
   const topCandidates = candidates
     .sort((a, b) => (b.priorityBoost ?? 0) - (a.priorityBoost ?? 0))
-    .slice(0, 6);
+    .slice(0, 16);
   const results = await Promise.all(
     topCandidates.map((c) => verifyStreamCandidate(c))
   );
@@ -1981,12 +2034,10 @@ function buildAnonymizedSnapshot(
     }
   }
 
-  const ranked = sortBrowserCompatibleFirst(
-    dedupedStreams.map((s) => ({
-      ...s,
-      url: s.rawUrl,
-      formato: s.format,
-    }))
+  // Exact 5-stage ranking system requested:
+  // Koi (+250k) -> PT-BR (+150k) -> EN/JP (+50k) -> Res (h*10) -> HLS (+6k)/MP4 (+4k) -> Multi-qual/latency
+  const ranked = dedupedStreams.sort(
+    (a, b) => calculateStreamScore(b) - calculateStreamScore(a)
   );
 
   // Keep H.264 verified servers first; cap HEVC entries to 2 at the very bottom if H.264 exists
@@ -1998,10 +2049,13 @@ function buildAnonymizedSnapshot(
     const streamId = registerStream(item.rawUrl, item.referer, item.format, item.extraHeaders);
     const qMeta = formatQualityDisplay(item.qualidade);
     const aMeta = formatAudioDisplay(item.idioma, item.qualidade);
-    const ext = item.format === 'mp4' ? 'media.mp4' : 'master.m3u8';
+    const ext = item.format === 'mp4' ? 'media.mp4' : item.format === 'dash' ? 'manifest.mpd' : 'master.m3u8';
+    const label = item.providerLabel
+      ? `${item.providerLabel}${item.isPtBr ? ' · Dublado' : ''}`
+      : `Servidor ${idx + 1}`;
     return {
       id: streamId,
-      label: `Servidor ${idx + 1}`,
+      label,
       audio: aMeta.audio,
       quality: qMeta.quality,
       codec: item.codec,
@@ -2018,9 +2072,14 @@ function buildAnonymizedSnapshot(
     if (!subMap.has(key)) subMap.set(key, sub);
   }
   const sortedSubs = [...subMap.values()].sort((a, b) => {
-    const ra = normalizeSubtitleLang(a.lang, a.label).rank;
-    const rb = normalizeSubtitleLang(b.lang, b.label).rank;
-    return rb - ra;
+    const scoreSub = (s: InternalSubtitle) => {
+      let sc = 0;
+      if (/pt|br|portugu/i.test(s.lang) || /portugu/i.test(s.label)) sc += 1000;
+      else if (/en|ingl/i.test(s.lang) || /ingl/i.test(s.label)) sc += 500;
+      if (s.rawUrl.endsWith('.vtt')) sc += 50;
+      return sc;
+    };
+    return scoreSub(b) - scoreSub(a);
   });
   const anonymizedSubtitles: AnonymizedSubtitle[] = sortedSubs.slice(0, 14).map((sub) => {
     const subId = registerSubtitle(sub.rawUrl, sub.referer, sub.lang, sub.label, sub.extraHeaders);
@@ -2072,15 +2131,67 @@ function launchAllPipelines(
     }
   };
 
+  const runSourceExtractor = async (
+    extractor: () => Promise<InternalExtractedStream[]>
+  ) => {
+    try {
+      const extractedStreams = await extractor();
+      const verified = await verifyStreamsBatch(extractedStreams);
+      if (verified.length > 0) {
+        onBatch({
+          streams: verified,
+          subtitles: [],
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const runSubtitleFetcher = async (
+    fetcher: () => Promise<InternalSubtitle[]>
+  ) => {
+    try {
+      const subs = await fetcher();
+      if (subs.length > 0) {
+        onBatch({
+          streams: [],
+          subtitles: subs,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const targetQuery: TargetQuery = {
+    kind: parsed.kind,
+    tmdbId: parsed.tmdbId,
+    season: parsed.kind === 'tv' ? parsed.season : undefined,
+    episode: parsed.kind === 'tv' ? parsed.episode : undefined,
+  };
+
   // Launch TMDB-ID pipelines at t=0ms with ZERO blocking on external_ids lookup
   const tier1Tasks: Array<Promise<void>> = [
     runAndVerify(extractWatchPlayPipeline(parsed, 1500)),
     runAndVerify(extractHorcruxPipeline(parsed, 1200)),
     runAndVerify(extractMultiNodePipeline(parsed, 2200)),
     runAndVerify(extractPlayerFlixPipeline(parsed, 1600)),
+    // Fontes Multi-Áudio e Internacionais
+    runSourceExtractor(() => extractKoiMbox(targetQuery, 2800)),
+    runSourceExtractor(() => extractAetherNautilus(targetQuery, 2800)),
+    runSourceExtractor(() => extractVelvetVidbox(targetQuery, 2600)),
+    runSourceExtractor(() => extractSolstice(targetQuery, 2600)),
+    runSourceExtractor(() => extractLyraShegu(targetQuery, 2600)),
+    runSourceExtractor(() => extractPolarisMoscow(targetQuery, 2600)),
+    runSourceExtractor(() => extractOrionAmnesty(targetQuery, 2600)),
+    runSourceExtractor(() => extractObsidianPunkflix(targetQuery, 2800)),
+    runSourceExtractor(() => extractVortexSilvia(targetQuery, 2600)),
+    runSourceExtractor(() => extractZephyrFlikhub(targetQuery, 2600)),
+    runSubtitleFetcher(() => fetchNatsukiSubs(parsed.tmdbId, 2400)),
   ];
 
-  // FenixFlix relies strictly on IMDb IDs (tt...) for both movies and series in Tier 2 below
+  // FenixFlix (Arara) and KingVOD (Coruja) rely strictly on IMDb IDs (tt...) for both movies and series in Tier 2 below
   // Launch IMDb-based Stremio pipelines the instant imdbPromise resolves (~0-180ms)
   const tier2Task = imdbPromise.then(async (imdbId) => {
     if (!imdbId) return;
@@ -2115,6 +2226,7 @@ function launchAllPipelines(
             timeoutMs: 1700,
             priorityBoost: 54,
             defaultPtBr: true,
+            providerLabel: 'Coruja',
           })
         ),
         runAndVerify(
@@ -2154,6 +2266,7 @@ function launchAllPipelines(
             timeoutMs: 7500,
             priorityBoost: 60,
             defaultPtBr: true,
+            providerLabel: 'Arara',
           })
         )
       );
@@ -2162,18 +2275,36 @@ function launchAllPipelines(
     await Promise.allSettled(imdbTasks);
   });
 
-  // Launch anime-specific PT-BR pipelines in parallel once AnimeContext resolves (~0-250ms)
+  // Launch anime-specific pipelines in parallel once AnimeContext / AniList resolves (~0-250ms)
   const animeTask =
     parsed.kind === 'tv'
-      ? resolveAnimeContext(parsed).then(async (ctx) => {
-          if (!ctx || !ctx.isAnime) return;
-          await Promise.allSettled([
-            runAndVerify(extractAnimesFhdPipeline(ctx, parsed, 2800)),
-            runAndVerify(extractAnimesDigitalPipeline(ctx, parsed, 2800)),
-            runAndVerify(extractAniTubePipeline(ctx, parsed, 2800)),
-            runAndVerify(extractAnrollPipeline(ctx, parsed, 2900)),
+      ? (async () => {
+          const [ctx, anilistId] = await Promise.all([
+            resolveAnimeContext(parsed),
+            resolveAniListFromTmdb(parsed.tmdbId),
           ]);
-        })
+          const subtasks: Array<Promise<void>> = [];
+          if (ctx && ctx.isAnime) {
+            subtasks.push(
+              runAndVerify(extractAnimesFhdPipeline(ctx, parsed, 2800)),
+              runAndVerify(extractAnimesDigitalPipeline(ctx, parsed, 2800)),
+              runAndVerify(extractAniTubePipeline(ctx, parsed, 2800)),
+              runAndVerify(extractAnrollPipeline(ctx, parsed, 2900))
+            );
+          }
+          if (anilistId) {
+            const ep = parsed.episode;
+            subtasks.push(
+              runSourceExtractor(() => extractKitsuneAnime(anilistId, ep, 2800)),
+              runSourceExtractor(() => extractShiroAnime(anilistId, ep, 2800)),
+              runSourceExtractor(() => extractAkiraAnime(anilistId, ep, 2800)),
+              runSourceExtractor(() => extractRoninAnime(anilistId, ep, 2800)),
+              runSourceExtractor(() => extractSoraAnime(anilistId, ep, 2800)),
+              runSourceExtractor(() => extractKuroAnime(anilistId, ep, 2800))
+            );
+          }
+          await Promise.allSettled(subtasks);
+        })()
       : Promise.resolve();
 
   return Promise.allSettled([...tier1Tasks, tier2Task, animeTask]).then(() => {});
@@ -3607,7 +3738,7 @@ async function startServer() {
             url: resolved.url,
             referer: resolved.referer,
             extraHeaders: resolved.extraHeaders,
-            format: req.params.file.endsWith('.mp4') ? 'mp4' : 'hls',
+            format: req.params.file.endsWith('.mp4') ? 'mp4' : req.params.file.endsWith('.mpd') ? 'dash' : 'hls',
             expiresAt: Date.now() + STREAM_REGISTRY_TTL_MS,
           };
           streamRegistry.set(req.params.id, entry);

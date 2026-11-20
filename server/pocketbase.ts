@@ -131,7 +131,7 @@ function readStore(): LocalStore {
   try {
     const file = storeFile();
     if (!fs.existsSync(file)) {
-      memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE));
+      memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE)) as LocalStore;
       scheduleSaveStore();
       return memoryStore;
     }
@@ -143,7 +143,7 @@ function readStore(): LocalStore {
     };
     return memoryStore;
   } catch {
-    memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE));
+    memoryStore = JSON.parse(JSON.stringify(DEFAULT_STORE)) as LocalStore;
     return memoryStore;
   }
 }

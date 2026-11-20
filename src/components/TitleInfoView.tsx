@@ -363,7 +363,7 @@ export const TitleInfoView: React.FC<TitleInfoViewProps> = ({
                             const matchingEps = (item.episodes ?? [])
                               .filter((e) => e.season === sNum)
                               .sort((a, b) => a.episode - b.episode);
-                            const targetEp = matchingEps[0]?.episode ?? 1;
+                            const targetEp = matchingEps[0]?.episode ?? (sNum === selectedSeason ? selectedEpisode : 1);
                             onSelectSeasonEpisode(sNum, targetEp, false);
                           }}
                           className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs sm:text-sm transition-colors cursor-pointer ${

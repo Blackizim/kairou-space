@@ -168,6 +168,9 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
   const manualStreamOverrideRef = useRef<boolean>(initialStreamIndex > 0);
   const emptyStreamsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoRefreshedRef = useRef(false);
+  const firstFrameWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bufferingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userSubOverrideRef = useRef(false);
 
   const supportsHevc = useMemo(
     () =>
@@ -211,11 +214,9 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
           if (b !== -1) return b;
           const j = findIdx((s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality));
           if (j !== -1) return j;
-          const k = findIdx((s) => isStreamBrowserCompatible(s) && s.format === 'hls');
+          const k = findIdx((s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality) && s.format === 'hls');
           if (k !== -1) return k;
-          const m = findIdx((s) => isStreamBrowserCompatible(s));
-          if (m !== -1) return m;
-          return allowUntestedAny ? findIdx(() => true) : -1;
+          return allowUntestedAny ? findIdx((s) => !isUltraHdQuality(s.quality)) : -1;
         })();
 
       if (idx === -1) return null;
@@ -228,16 +229,27 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     if (streams.length === 0) return { stream: null, idx: 0 };
     const safeIdx = Math.min(Math.max(0, initialStreamIndex), streams.length - 1);
     const requested = streams[safeIdx];
-    // Respect explicit user choice (> 0); on default launch (0), enforce <= 1080p preferring real 1080p first
+    // Rule 3: NEVER auto-start in 4K (neither for VIP nor Auto).
+    // Only accept requested stream if user explicitly clicked a server (initialStreamIndex > 0)
+    // or if it's <= 1080p compatible
     if (
       requested &&
       isStreamBrowserCompatible(requested) &&
-      (initialStreamIndex > 0 || (!isUltraHdQuality(requested.quality) && /1080p|full\s*hd/i.test(requested.quality)))
+      (initialStreamIndex > 0 || !isUltraHdQuality(requested.quality))
     ) {
-      return { stream: requested, idx: safeIdx };
+      if (initialStreamIndex === 0 && !/1080p|full\s*hd/i.test(requested.quality)) {
+        // Fall through to autoPick to prioritize crisp 1080p if available
+      } else {
+        return { stream: requested, idx: safeIdx };
+      }
     }
     const autoPick = pickNextAutoStream(streams, false);
     if (autoPick) return autoPick;
+    const non4k = streams.find((s) => isStreamBrowserCompatible(s) && !isUltraHdQuality(s.quality));
+    if (non4k) {
+      const idx = streams.indexOf(non4k);
+      return { stream: non4k, idx: idx !== -1 ? idx : 0 };
+    }
     return { stream: requested ?? streams[0], idx: safeIdx };
   }, [streams, initialStreamIndex, isStreamBrowserCompatible, pickNextAutoStream]);
 
@@ -288,6 +300,15 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     triedIdsRef.current.clear();
     triedDirectMp4Ref.current.clear();
     autoRefreshedRef.current = false;
+    userSubOverrideRef.current = false;
+    if (firstFrameWatchdogRef.current) {
+      clearTimeout(firstFrameWatchdogRef.current);
+      firstFrameWatchdogRef.current = null;
+    }
+    if (bufferingWatchdogRef.current) {
+      clearTimeout(bufferingWatchdogRef.current);
+      bufferingWatchdogRef.current = null;
+    }
   }, [item.id, season, episode]);
 
   // Audio tracks state (for multi-audio HLS streams)
@@ -448,6 +469,20 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     [allSubtitles, activeSubId]
   );
 
+  // Etapa 5: Subtitle rule:
+  // Se for dublado (PT-BR), legenda inicia DESLIGADA por padrão.
+  // Se for original/legendado, legenda em Português inicia LIGADA por padrão.
+  useEffect(() => {
+    if (userSubOverrideRef.current || !activeStream) return;
+    const isDub = activeStream.isPtBr || /dub|pt|bra/i.test(activeStream.audio);
+    if (isDub) {
+      setActiveSubId(null);
+    } else {
+      const pt = allSubtitles.find((s) => /pt/i.test(s.lang) || /portug/i.test(s.label));
+      setActiveSubId(pt?.id ?? allSubtitles[0]?.id ?? null);
+    }
+  }, [activeStream?.id, activeStream?.isPtBr, activeStream?.audio, allSubtitles]);
+
   // Auto-hide controls after 3.2s when playing & no popover open
   const bumpControls = useCallback(() => {
     setShowControls(true);
@@ -521,6 +556,56 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
     },
     [markCurrentFailedAndFallback]
   );
+
+  // Watchdog 1: 7.5s watchdog for initial frame render (solves infinite "Sincronizando áudio e vídeo...")
+  useEffect(() => {
+    if (firstFrameWatchdogRef.current) {
+      clearTimeout(firstFrameWatchdogRef.current);
+      firstFrameWatchdogRef.current = null;
+    }
+
+    if (activeStream && !hasFirstFrame && !errorMsg) {
+      firstFrameWatchdogRef.current = setTimeout(() => {
+        if (!hasFirstFrame) {
+          markCurrentFailedAndFallback(
+            'Servidor demorou para responder. Alternando para o próximo...'
+          );
+        }
+      }, 7500);
+    }
+
+    return () => {
+      if (firstFrameWatchdogRef.current) {
+        clearTimeout(firstFrameWatchdogRef.current);
+        firstFrameWatchdogRef.current = null;
+      }
+    };
+  }, [activeStream?.id, hasFirstFrame, errorMsg, markCurrentFailedAndFallback]);
+
+  // Watchdog 2: 10s watchdog for buffering stall during active playback
+  useEffect(() => {
+    if (bufferingWatchdogRef.current) {
+      clearTimeout(bufferingWatchdogRef.current);
+      bufferingWatchdogRef.current = null;
+    }
+
+    if (hasFirstFrame && isBuffering && isPlaying && !errorMsg) {
+      bufferingWatchdogRef.current = setTimeout(() => {
+        if (isBuffering) {
+          markCurrentFailedAndFallback(
+            'Transmissão travou no carregamento. Alternando para o próximo servidor...'
+          );
+        }
+      }, 10000);
+    }
+
+    return () => {
+      if (bufferingWatchdogRef.current) {
+        clearTimeout(bufferingWatchdogRef.current);
+        bufferingWatchdogRef.current = null;
+      }
+    };
+  }, [hasFirstFrame, isBuffering, isPlaying, errorMsg, markCurrentFailedAndFallback]);
 
   // Attach HLS / MP4 stream to <video>
   useEffect(() => {
@@ -1065,6 +1150,7 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
       trackUrl: blobUrl,
     };
     setUploadedSubs((prev) => [sub, ...prev]);
+    userSubOverrideRef.current = true;
     setActiveSubId(id);
     e.target.value = '';
   };
@@ -1568,7 +1654,10 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
           <div className="space-y-1.5">
             <button
               type="button"
-              onClick={() => setActiveSubId(null)}
+              onClick={() => {
+                userSubOverrideRef.current = true;
+                setActiveSubId(null);
+              }}
               className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
                 activeSubId === null
                   ? 'bg-white/14 text-white'
@@ -1659,7 +1748,10 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
                   <button
                     key={sub.id}
                     type="button"
-                    onClick={() => setActiveSubId(sub.id)}
+                    onClick={() => {
+                      userSubOverrideRef.current = true;
+                      setActiveSubId(sub.id);
+                    }}
                     className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs sm:text-sm transition-colors cursor-pointer ${
                       selected
                         ? 'bg-white/14 text-white font-semibold'
@@ -1790,6 +1882,7 @@ export const CinemaPlayer: React.FC<CinemaPlayerProps> = ({
                     role="switch"
                     aria-checked={Boolean(activeSubId)}
                     onClick={() => {
+                      userSubOverrideRef.current = true;
                       if (activeSubId) {
                         setActiveSubId(null);
                       } else if (allSubtitles.length > 0) {
