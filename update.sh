@@ -1,40 +1,32 @@
 #!/bin/bash
 set -e
 
-echo "=== 1. BAIXANDO NOVO SERVER.MJS COMPILADO ==="
+echo "=== 1. BAIXANDO ARQUIVOS COMPILADOS DO GITHUB CDN ==="
+mkdir -p /var/www/kairou/dist/assets /var/www/kairou/server
+
+echo "Baixando server.mjs..."
 curl -4 -fsSL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist-server/server.mjs -o /var/www/kairou/server.mjs
-mkdir -p /var/www/kairou/server
 echo "import '../server.mjs';" > /var/www/kairou/server/server.js
-echo "[OK] server.mjs baixado com sucesso!"
 
-echo "=== 2. ATUALIZANDO NGINX ==="
-python3 -c "
-fpath = '/etc/nginx/sites-available/kairou'
-with open(fpath, 'r') as f:
-    c = f.read()
+echo "Baixando frontend (index.html, JS, CSS)..."
+curl -4 -fsSL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist/index.html -o /var/www/kairou/dist/index.html
+curl -4 -fsSL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist/assets/index-CYgTw0RC.js -o /var/www/kairou/dist/assets/index-CYgTw0RC.js
+curl -4 -fsSL https://raw.githubusercontent.com/Blackizim/kairou-space/main/dist/assets/index-x1GIZ1SN.css -o /var/www/kairou/dist/assets/index-x1GIZ1SN.css
+chown -R www-data:www-data /var/www/kairou/dist
+echo "[OK] Arquivos baixados e permissoes ajustadas!"
 
-target1 = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health)'
-target2 = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip)'
-repl = 'location ~ ^/api/(extract|channels|matches|vip|tv|bunny|version|tmdb|anilist|tvmaze|config|send|skip|pb|catalog|title|search|stream|p|subtitle|health|analytics|urgent-announcement)'
+echo "=== 2. CONFIGURANDO ANTI-BOT NO SSHD ==="
+mkdir -p /etc/ssh/sshd_config.d
+echo -e "MaxStartups 100:30:200\nLoginGraceTime 20" > /etc/ssh/sshd_config.d/99-anti-bot.conf
+systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+echo "[OK] SSHD otimizado contra bot floods!"
 
-if target1 in c:
-    c = c.replace(target1, repl)
-elif target2 in c:
-    c = c.replace(target2, repl)
-
-if 'proxy_buffering off;' not in c and 'proxy_pass http://127.0.0.1:3001;' in c:
-    c = c.replace('proxy_pass http://127.0.0.1:3001;', 'proxy_pass http://127.0.0.1:3001;\\n        proxy_buffering off;\\n        proxy_cache off;\\n        proxy_read_timeout 300s;')
-
-with open(fpath, 'w') as f:
-    f.write(c)
-"
+echo "=== 3. RECARREGANDO NGINX E PM2 ==="
 nginx -t && systemctl reload nginx
-
-echo "=== 3. REINICIANDO PM2 ==="
 pm2 restart kairou-api --update-env
 
-echo "=== 4. TESTANDO ENDPOINTS LOCAIS ==="
+echo "=== 4. TESTANDO ENDPOINTS ==="
+sleep 2
 curl -s http://127.0.0.1:3001/api/health
 echo ""
-
-echo "=== DEPLOY CONCLUIDO COM SUCESSO! ==="
+echo "=== DEPLOY CONCLUIDO COM EXITO TOTAL! ==="
